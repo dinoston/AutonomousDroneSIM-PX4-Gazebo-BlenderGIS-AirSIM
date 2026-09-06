@@ -8,6 +8,7 @@
 #include "FlyingNPCPawn.generated.h"
 
 class AActor;
+class APawn;
 class UPrimitiveComponent;
 class USphereComponent;
 class UStaticMeshComponent;
@@ -110,6 +111,42 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Debug")
 	bool bDrawAvoidanceDebug = false;
 
+	/** Mark this pawn as an enemy target at runtime. / 실행 중 이 Pawn을 적 표적으로 표시합니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection")
+	bool bIsEnemyTarget = true;
+
+	/** Enable player-to-enemy visibility raycasts. / 플레이어에서 적까지의 시야 레이캐스트를 활성화합니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection")
+	bool bEnableProximityDetection = true;
+
+	/** Maximum recognition distance in centimetres. / 적 인식 최대 거리(cm)입니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection", meta = (ClampMin = "100.0"))
+	float DetectionRangeCm = 5000.0f;
+
+	/** Longer Radar visualization range in centimetres. / Radar 시각화의 장거리 범위(cm)입니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection", meta = (ClampMin = "100.0"))
+	float RadarDetectionRangeCm = 20000.0f;
+
+	/** Detection refresh period. / 적 탐지 갱신 주기(초)입니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection", meta = (ClampMin = "0.02"))
+	float DetectionUpdateIntervalSeconds = 0.1f;
+
+	/** Collision channel used by the line-of-sight ray. / 시야 레이가 사용하는 충돌 채널입니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection")
+	TEnumAsByte<ECollisionChannel> DetectionTraceChannel = ECC_Visibility;
+
+	/** Draw the recognition ray, 3D box, and range in the game viewport. / 게임 화면에 인식 레이, 3D 박스와 거리를 표시합니다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flying NPC|Detection")
+	bool bDrawDetectionDebug = true;
+
+	/** True while the player drone has direct line of sight. / 플레이어 드론과 시야가 연결되어 있으면 참입니다. */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Flying NPC|Detection")
+	bool bTargetDetected = false;
+
+	/** Latest player-to-target distance in centimetres. / 최근 플레이어-표적 거리(cm)입니다. */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Flying NPC|Detection")
+	float DetectedDistanceCm = -1.0f;
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -127,6 +164,9 @@ private:
 	FVector ComputeSteeringDirection(const FVector& DesiredDirection, float DeltaSeconds);
 	float TraceClearance(const FVector& Direction, float DistanceCm, bool bDebug) const;
 	void ApplyMovementSettings();
+	void UpdateProximityDetection(float DeltaSeconds);
+	APawn* FindObserverPawn() const;
+	void DrawDetectedTarget(float DurationSeconds, bool bDrawLidarBox, bool bDrawRadarBox) const;
 
 	int32 PatrolPointIndex = 0;
 	bool bPatrolActive = false;
@@ -134,4 +174,5 @@ private:
 	FVector DirectTargetLocation = FVector::ZeroVector;
 	FVector CommittedAvoidanceDirection = FVector::ZeroVector;
 	float AvoidanceCommitRemaining = 0.0f;
+	float DetectionUpdateAccumulator = 0.0f;
 };

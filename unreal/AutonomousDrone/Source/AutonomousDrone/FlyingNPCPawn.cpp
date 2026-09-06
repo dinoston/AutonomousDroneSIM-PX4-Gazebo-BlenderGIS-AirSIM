@@ -5,9 +5,31 @@
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "DrawDebugHelpers.h"
+#include "EngineUtils.h"
 #include "Engine/World.h"
 #include "GameFramework/FloatingPawnMovement.h"
 #include "GameFramework/PawnMovementComponent.h"
+#include "HAL/IConsoleManager.h"
+#include "Kismet/GameplayStatics.h"
+
+namespace
+{
+	// Mission Control changes these console variables through AirSim's
+	// simRunConsoleCommand API. Both visualizations start enabled.
+	// Mission Control은 AirSim simRunConsoleCommand API로 이 콘솔 변수를
+	// 변경하며, 두 디버그 표시는 기본적으로 켜집니다.
+	TAutoConsoleVariable<int32> CVarAutonomousDroneLidarDebug(
+		TEXT("autodrone.LidarDebug"),
+		1,
+		TEXT("Show the inner LiDAR enemy box (0=off, 1=on). / LiDAR 내부 적 박스를 표시합니다."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarAutonomousDroneRadarDebug(
+		TEXT("autodrone.RadarDebug"),
+		1,
+		TEXT("Show the larger blue Radar enemy box (0=off, 1=on). / 더 큰 파란 Radar 적 박스를 표시합니다."),
+		ECVF_Default);
+}
 
 AFlyingNPCPawn::AFlyingNPCPawn()
 {
@@ -31,7 +53,7 @@ AFlyingNPCPawn::AFlyingNPCPawn()
 	FlightMovement->TurningBoost = 8.0f;
 
 	AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;
-	Tags.Add(TEXT("CivilianDrone"));
+	Tags.Add(TEXT("AirborneNPC"));
 }
 
 void AFlyingNPCPawn::BeginPlay()
@@ -40,6 +62,14 @@ void AFlyingNPCPawn::BeginPlay()
 
 	ApplyMovementSettings();
 	CollisionSphere->OnComponentHit.AddDynamic(this, &AFlyingNPCPawn::HandleCollisionHit);
+	if (bIsEnemyTarget)
+	{
+		Tags.AddUnique(TEXT("EnemyDrone"));
+	}
+	else
+	{
+		Tags.Remove(TEXT("EnemyDrone"));
+	}
 
 	if (bStartPatrolOnBeginPlay)
 	{
@@ -53,6 +83,7 @@ void AFlyingNPCPawn::Tick(float DeltaSeconds)
 
 	ApplyMovementSettings();
 	AvoidanceCommitRemaining = FMath::Max(0.0f, AvoidanceCommitRemaining - DeltaSeconds);
+	UpdateProximityDetection(DeltaSeconds);
 
 	if (!bPatrolActive || FlightMovement == nullptr)
 	{
@@ -294,6 +325,180 @@ float AFlyingNPCPawn::TraceClearance(const FVector& Direction, float DistanceCm,
 	}
 
 	return bHit ? FMath::Max(0.0f, Hit.Distance) : DistanceCm;
+}
+
+void AFlyingNPCPawn::UpdateProximityDetection(float DeltaSeconds)
+{
+	if (!bEnableProximityDetection || !bIsEnemyTarget)
+	{
+		bTargetDetected = false;
+		DetectedDistanceCm = -1.0f;
+		return;
+	}
+
+	DetectionUpdateAccumulator += DeltaSeconds;
+	const float UpdateInterval = FMath::Max(0.02f, DetectionUpdateIntervalSeconds);
+	if (DetectionUpdateAccumulator < UpdateInterval)
+	{
+		return;
+	}
+	DetectionUpdateAccumulator = 0.0f;
+
+	APawn* ObserverPawn = FindObserverPawn();
+	if (ObserverPawn == nullptr)
+	{
+		bTargetDetected = false;
+		DetectedDistanceCm = -1.0f;
+		return;
+	}
+
+	const FVector RayStart = ObserverPawn->GetActorLocation();
+	const FVector RayEnd = GetActorLocation();
+	DetectedDistanceCm = FVector::Distance(RayStart, RayEnd);
+	const bool bLidarDebugEnabled = CVarAutonomousDroneLidarDebug.GetValueOnGameThread() != 0;
+	const bool bRadarDebugEnabled = CVarAutonomousDroneRadarDebug.GetValueOnGameThread() != 0;
+	const bool bWithinLidarRange = DetectedDistanceCm <= DetectionRangeCm;
+	const bool bWithinRadarRange = DetectedDistanceCm <= RadarDetectionRangeCm;
+	if (!bWithinLidarRange && !bWithinRadarRange)
+	{
+		bTargetDetected = false;
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		bTargetDetected = false;
+		return;
+	}
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(FlyingNPCDetectionRay), true, ObserverPawn);
+	QueryParams.AddIgnoredActor(ObserverPawn);
+	FHitResult Hit;
+	const bool bHit = World->LineTraceSingleByChannel(
+		Hit,
+		RayStart,
+		RayEnd,
+		DetectionTraceChannel,
+		QueryParams);
+	bTargetDetected = !bHit || Hit.GetActor() == this;
+
+	const bool bDrawLidarBox = bLidarDebugEnabled && bWithinLidarRange;
+	const bool bDrawRadarBox = bRadarDebugEnabled && bWithinRadarRange;
+	if (bDrawDetectionDebug && (bDrawLidarBox || bDrawRadarBox))
+	{
+		const float DrawDuration = UpdateInterval * 1.25f;
+		const FVector VisibleRayEnd = bHit ? Hit.ImpactPoint : RayEnd;
+		const FColor RayColor = !bTargetDetected
+			? FColor::Yellow
+			: (bDrawLidarBox ? FColor::Red : FColor(36, 148, 255));
+		DrawDebugLine(
+			World,
+			RayStart,
+			VisibleRayEnd,
+			RayColor,
+			false,
+			DrawDuration,
+			0,
+			2.0f);
+		if (bTargetDetected)
+		{
+			DrawDetectedTarget(DrawDuration, bDrawLidarBox, bDrawRadarBox);
+		}
+	}
+}
+
+APawn* AFlyingNPCPawn::FindObserverPawn() const
+{
+	APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+	if (PlayerPawn != nullptr && PlayerPawn != this && !PlayerPawn->IsA<AFlyingNPCPawn>())
+	{
+		return PlayerPawn;
+	}
+
+	// AirSim can own the vehicle without a conventional player possession.
+	// AirSim 기체는 일반 PlayerController에 빙의되지 않을 수 있으므로
+	// 가장 가까운 비-NPC Pawn을 관측 기체로 사용합니다.
+	APawn* ClosestPawn = nullptr;
+	float ClosestDistanceSquared = TNumericLimits<float>::Max();
+	for (TActorIterator<APawn> It(GetWorld()); It; ++It)
+	{
+		APawn* Candidate = *It;
+		if (Candidate == nullptr || Candidate == this || Candidate->IsA<AFlyingNPCPawn>())
+		{
+			continue;
+		}
+		const float DistanceSquared = FVector::DistSquared(
+			Candidate->GetActorLocation(),
+			GetActorLocation());
+		if (DistanceSquared < ClosestDistanceSquared)
+		{
+			ClosestDistanceSquared = DistanceSquared;
+			ClosestPawn = Candidate;
+		}
+	}
+	return ClosestPawn;
+}
+
+void AFlyingNPCPawn::DrawDetectedTarget(
+	float DurationSeconds,
+	bool bDrawLidarBox,
+	bool bDrawRadarBox) const
+{
+	if (GetWorld() == nullptr || DroneMesh == nullptr)
+	{
+		return;
+	}
+
+	// Component bounds create an immediately visible world-space box without
+	// requiring a separate HUD Blueprint or post-process material.
+	// 컴포넌트 경계를 사용하면 별도 HUD Blueprint나 포스트 프로세스 없이
+	// 월드 공간 바운딩 박스를 게임 화면에서 즉시 확인할 수 있습니다.
+	const FBoxSphereBounds Bounds = DroneMesh->Bounds;
+	if (bDrawLidarBox)
+	{
+		DrawDebugBox(
+			GetWorld(),
+			Bounds.Origin,
+			Bounds.BoxExtent + FVector(10.0f),
+			FQuat::Identity,
+			FColor::Red,
+			false,
+			DurationSeconds,
+			0,
+			4.0f);
+	}
+	if (bDrawRadarBox)
+	{
+		// Radar uses a clearly larger blue box so simultaneous detections
+		// remain visually distinguishable from the inner LiDAR box.
+		// Radar는 LiDAR 내부 박스와 겹쳐도 구별되도록 더 큰 파란 박스를 씁니다.
+		DrawDebugBox(
+			GetWorld(),
+			Bounds.Origin,
+			Bounds.BoxExtent * 1.18f + FVector(25.0f),
+			FQuat::Identity,
+			FColor(36, 148, 255),
+			false,
+			DurationSeconds,
+			0,
+			4.0f);
+	}
+	const FColor LabelColor = bDrawRadarBox && !bDrawLidarBox
+		? FColor(36, 148, 255)
+		: FColor::Red;
+	const TCHAR* SensorLabel = bDrawLidarBox && bDrawRadarBox
+		? TEXT("LIDAR + RADAR")
+		: (bDrawRadarBox ? TEXT("RADAR") : TEXT("LIDAR"));
+	DrawDebugString(
+		GetWorld(),
+		Bounds.Origin + FVector(0.0f, 0.0f, Bounds.BoxExtent.Z + 40.0f),
+		FString::Printf(TEXT("%s  ENEMY DRONE  %.1f m"), SensorLabel, DetectedDistanceCm / 100.0f),
+		nullptr,
+		LabelColor,
+		DurationSeconds,
+		true,
+		1.1f);
 }
 
 void AFlyingNPCPawn::ApplyMovementSettings()

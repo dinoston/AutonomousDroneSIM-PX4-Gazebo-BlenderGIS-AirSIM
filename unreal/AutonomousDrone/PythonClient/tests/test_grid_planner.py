@@ -1,5 +1,7 @@
 from navigation.grid_planner import AltitudeGridPlanner
 from navigation.grid_planner import PlannerConfig
+from navigation.grid_planner import build_vertical_barrier
+from navigation.grid_planner import split_terminal_vertical_leg
 
 import numpy as np
 import pytest
@@ -82,3 +84,59 @@ def test_ceiling_cap_forces_a_lower_cruise_layer() -> None:
     assert path[0] == (-10.0, 0.0, 10.0)
     assert max(altitude for _x, _y, altitude in path) <= 10.0
     assert path[-1] == (10.0, 0.0, 5.0)
+
+
+def test_detected_facade_is_blocked_at_every_flight_layer() -> None:
+    planner = AltitudeGridPlanner(PlannerConfig(max_extra_altitude_m=8.0))
+    barrier = build_vertical_barrier(
+        (5.0, 0.0, -5.0),
+        (1.0, 0.0),
+        half_span_m=12.0,
+        minimum_altitude_m=1.0,
+        maximum_altitude_m=13.0,
+    )
+    planner.set_obstacle_points(barrier)
+    for altitude in (1.0, 5.0, 9.0, 13.0):
+        blocked = planner._blocked_cells(altitude)
+        assert planner._to_cell((5.0, 0.0)) in blocked
+
+
+def test_detected_facade_produces_a_lateral_fly_by_route() -> None:
+    config = PlannerConfig(
+        half_extent_m=900.0,
+        resolution_m=2.5,
+        drone_radius_m=2.5,
+        vertical_clearance_m=1.5,
+        altitude_step_m=2.0,
+        max_extra_altitude_m=8.0,
+    )
+    planner = AltitudeGridPlanner(config)
+    planner.set_obstacle_points(
+        build_vertical_barrier((35.0, 0.0, -5.0), (1.0, 0.0), 12.0, 1.0, 13.0)
+    )
+    path = planner.plan((0.0, 0.0), (100.0, 0.0), 5.0, 5.0)
+    assert any(abs(y) >= 12.5 for _x, y, _altitude in path)
+    assert path[-1] == (100.0, 0.0, 5.0)
+
+
+def test_terminal_descent_is_separated_from_horizontal_flight() -> None:
+    horizontal, descent_altitude = split_terminal_vertical_leg(
+        [(20.0, -10.0, 13.0), (100.0, 0.0, 13.0), (100.0, 0.0, 5.0)]
+    )
+    assert horizontal == [(20.0, -10.0, 13.0), (100.0, 0.0, 13.0)]
+    assert descent_altitude == 5.0
+
+
+def test_astar_does_not_cut_through_a_blocked_diagonal_corner() -> None:
+    planner = AltitudeGridPlanner(
+        PlannerConfig(half_extent_m=10.0, resolution_m=1.0, drone_radius_m=0.1)
+    )
+    start = planner._to_cell((0.0, 0.0))
+    goal = planner._to_cell((1.0, 1.0))
+    blocked = {
+        planner._to_cell((1.0, 0.0)),
+        planner._to_cell((0.0, 1.0)),
+    }
+    path = planner._astar(start, goal, blocked)
+    assert len(path) > 2
+    assert not planner._line_clear(start, goal, blocked)

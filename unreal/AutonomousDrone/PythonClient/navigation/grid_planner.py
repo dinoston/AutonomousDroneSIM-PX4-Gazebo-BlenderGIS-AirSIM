@@ -13,6 +13,78 @@ from typing import Iterable
 import numpy as np
 
 
+def split_terminal_vertical_leg(
+    points: Iterable[tuple[float, float, float]],
+    xy_tolerance_m: float = 0.25,
+    altitude_tolerance_m: float = 0.25,
+) -> tuple[list[tuple[float, float, float]], float | None]:
+    """Separate a final descent from the horizontal AirSim path.
+
+    AirSim 수평 경로에서 마지막 수직 하강 구간을 분리합니다.
+
+    AirSim lookahead begins turning toward the final low point before reaching
+    its XY coordinate. Separating the leg keeps the vehicle level until it has
+    completely cleared the obstacle below.
+
+    AirSim 선행 제어는 목표 X/Y에 도달하기 전에 마지막 낮은 점을 향해 하강을
+    시작합니다. 하강 구간을 분리하면 아래 장애물을 완전히 통과할 때까지 현재
+    고도를 유지할 수 있습니다.
+    """
+    path = list(points)
+    if len(path) < 2:
+        return path, None
+    previous = path[-2]
+    final = path[-1]
+    same_xy = hypot(final[0] - previous[0], final[1] - previous[1]) <= xy_tolerance_m
+    descending = final[2] < previous[2] - altitude_tolerance_m
+    if same_xy and descending:
+        return path[:-1], float(final[2])
+    return path, None
+
+
+def build_vertical_barrier(
+    hit_xyz: tuple[float, float, float],
+    travel_direction_xy: tuple[float, float],
+    half_span_m: float,
+    minimum_altitude_m: float,
+    maximum_altitude_m: float,
+    spacing_m: float = 1.0,
+) -> np.ndarray:
+    """Extrude a frontal LiDAR hit into a conservative vertical wall.
+
+    전방 LiDAR 반사점을 보수적인 수직 벽으로 확장합니다.
+
+    A single scan only contains the currently visible part of a facade. The
+    extrusion prevents A* from treating the same tall wall as empty a few
+    metres above or beside the measured points.
+
+    한 번의 스캔에는 외벽의 현재 보이는 부분만 포함됩니다. 수직·수평 확장으로
+    A*가 측정점의 몇 m 위나 옆을 빈 공간으로 오판하지 않게 합니다.
+    """
+    direction_x, direction_y = map(float, travel_direction_xy)
+    direction_length = hypot(direction_x, direction_y)
+    if direction_length < 1e-6:
+        raise ValueError("이동 방향 벡터의 길이는 0보다 커야 합니다.")
+    direction_x /= direction_length
+    direction_y /= direction_length
+    tangent_x, tangent_y = -direction_y, direction_x
+    spacing = max(0.25, float(spacing_m))
+    span = max(spacing, float(half_span_m))
+    low = max(0.0, min(float(minimum_altitude_m), float(maximum_altitude_m)))
+    high = max(low, max(float(minimum_altitude_m), float(maximum_altitude_m)))
+    tangent_offsets = np.arange(-span, span + spacing * 0.5, spacing, dtype=np.float32)
+    altitudes = np.arange(low, high + spacing * 0.5, spacing, dtype=np.float32)
+    tangent_grid, altitude_grid = np.meshgrid(tangent_offsets, altitudes)
+    hit_x, hit_y, _hit_z = map(float, hit_xyz)
+    return np.column_stack(
+        (
+            hit_x + tangent_x * tangent_grid.ravel(),
+            hit_y + tangent_y * tangent_grid.ravel(),
+            -altitude_grid.ravel(),
+        )
+    ).astype(np.float32, copy=False)
+
+
 @dataclass(frozen=True)
 class PlannerConfig:
     half_extent_m: float = 100.0
@@ -187,6 +259,15 @@ class AltitudeGridPlanner:
                 nxt = (current[0] + dx, current[1] + dy)
                 if not self._inside(nxt) or nxt in blocked:
                     continue
+                # A diagonal move must not squeeze between two blocked corner
+                # cells. Without this guard a simplified path can clip a wall.
+                # 대각선 이동 시 막힌 두 모서리 사이를 비집고 지나가지 않게 하여
+                # 단순화된 경로가 벽을 스치는 현상을 방지합니다.
+                if dx and dy and (
+                    (current[0] + dx, current[1]) in blocked
+                    or (current[0], current[1] + dy) in blocked
+                ):
+                    continue
                 new_cost = cost[current] + step
                 if new_cost >= cost.get(nxt, float("inf")):
                     continue
@@ -216,11 +297,41 @@ class AltitudeGridPlanner:
 
     @staticmethod
     def _line_clear(a: tuple[int, int], b: tuple[int, int], blocked: set[tuple[int, int]]) -> bool:
-        count = max(abs(b[0] - a[0]), abs(b[1] - a[1]), 1)
-        for index in range(count + 1):
-            ratio = index / count
-            cell = (round(a[0] + (b[0] - a[0]) * ratio), round(a[1] + (b[1] - a[1]) * ratio))
-            if cell in blocked:
+        """Check every grid cell touched by a segment (supercover line).
+
+        선분이 닿는 모든 격자 셀을 검사합니다(슈퍼커버 선 검사).
+        """
+        x, y = a
+        delta_x = b[0] - a[0]
+        delta_y = b[1] - a[1]
+        steps_x = abs(delta_x)
+        steps_y = abs(delta_y)
+        sign_x = 1 if delta_x > 0 else -1 if delta_x < 0 else 0
+        sign_y = 1 if delta_y > 0 else -1 if delta_y < 0 else 0
+        moved_x = 0
+        moved_y = 0
+        if (x, y) in blocked:
+            return False
+        while moved_x < steps_x or moved_y < steps_y:
+            decision = (1 + 2 * moved_x) * steps_y - (1 + 2 * moved_y) * steps_x
+            if decision == 0:
+                # The segment crosses an exact cell corner. Both side cells
+                # must be free or the vehicle would clip the obstacle radius.
+                # 선분이 셀 모서리를 정확히 지날 때 양옆 셀을 모두 확인하여
+                # 기체 안전 반경이 장애물을 스치지 않게 합니다.
+                if (x + sign_x, y) in blocked or (x, y + sign_y) in blocked:
+                    return False
+                x += sign_x
+                y += sign_y
+                moved_x += 1
+                moved_y += 1
+            elif decision < 0:
+                x += sign_x
+                moved_x += 1
+            else:
+                y += sign_y
+                moved_y += 1
+            if (x, y) in blocked:
                 return False
         return True
 

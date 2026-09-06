@@ -10,6 +10,8 @@ import numpy as np
 
 from common.coordinates import altitude_to_ned_z, radians_to_degrees
 from common.safety import validate_destination
+from perception.radar_processor import RadarProcessor
+from perception.target_detector import TargetDetector
 
 
 class AirSimController:
@@ -17,14 +19,18 @@ class AirSimController:
         self,
         vehicle_name: str = "SimpleFlight",
         lidar_name: str = "Lidar1",
+        radar_name: str = "FrontRadar",
         host: str = "127.0.0.1",
         port: int = 41451,
     ) -> None:
         self.vehicle_name = vehicle_name
         self.lidar_name = lidar_name
+        self.radar_name = radar_name
         self.host = host
         self.port = port
         self.client: airsim.MultirotorClient | None = None
+        self._enemy_detection_ready = False
+        self._enemy_detection_error = ""
 
     @property
     def connected(self) -> bool:
@@ -42,6 +48,55 @@ class AirSimController:
         if not client.ping():
             raise ConnectionError("AirSim RPC ping에 실패했습니다.")
         self.client = client
+        self._configure_enemy_detection()
+
+    def _configure_enemy_detection(self) -> None:
+        """Register simulator filters for enemy drones and human characters.
+
+        적 드론과 사람 Character를 찾도록 시뮬레이터 이름 필터를 등록합니다.
+        """
+        client = self._require_client()
+        self._enemy_detection_ready = False
+        self._enemy_detection_error = ""
+        try:
+            client.simClearDetectionMeshNames(
+                "0",
+                airsim.ImageType.Scene,
+                vehicle_name=self.vehicle_name,
+            )
+            client.simSetDetectionFilterRadius(
+                "0",
+                airsim.ImageType.Scene,
+                5000,
+                vehicle_name=self.vehicle_name,
+            )
+            # Blueprint instances normally include BP_EnemyDrone in their
+            # generated name. The imported mesh pattern is a fallback.
+            # Blueprint 인스턴스 이름에는 보통 BP_EnemyDrone이 포함되며,
+            # 가져온 메시 이름 패턴은 이를 찾지 못할 때의 대체 필터입니다.
+            for pattern in (
+                "BP_EnemyDrone*",
+                "*EnemyDrone*",
+                "*Drone_FuturisticSleek*",
+                "BP_AINormalPeople_Drone*",
+                "*AINormalPeople*",
+                "*HumanTarget*",
+                "*Ch01*",
+                "*Ch02*",
+            ):
+                client.simAddDetectionFilterMeshName(
+                    "0",
+                    airsim.ImageType.Scene,
+                    pattern,
+                    vehicle_name=self.vehicle_name,
+                )
+            self._enemy_detection_ready = True
+        except Exception as exc:
+            # Camera and flight control remain usable when an older AirSim
+            # build does not expose the detection RPC endpoints.
+            # 이전 AirSim 빌드에 탐지 RPC가 없어도 카메라와 비행 제어는
+            # 계속 사용할 수 있도록 연결 자체는 유지합니다.
+            self._enemy_detection_error = str(exc)
 
     def disconnect(self) -> None:
         if self.client is not None:
@@ -61,6 +116,7 @@ class AirSimController:
             except Exception:
                 pass
         self.client = None
+        self._enemy_detection_ready = False
 
     def _require_client(self) -> airsim.MultirotorClient:
         if self.client is None:
@@ -109,6 +165,58 @@ class AirSimController:
             "qz": float(kin.orientation.z_val),
             "qw": float(kin.orientation.w_val),
         }
+
+    def radar_snapshot(self) -> dict[str, object]:
+        """Return active Echo/Radar samples and the vehicle pose.
+
+        Echo/Radar 활성 반사점과 월드 변환에 필요한 기체 자세를 반환합니다.
+        """
+        client = self._require_client()
+        data = client.getEchoData(
+            echo_name=self.radar_name,
+            vehicle_name=self.vehicle_name,
+        )
+        parsed = RadarProcessor.parse_active_echo(data.point_cloud)
+        point_count = len(parsed["points"])
+        state = client.getMultirotorState(vehicle_name=self.vehicle_name)
+        kin = state.kinematics_estimated
+        roll, pitch, yaw = airsim.quaternion_to_euler_angles(kin.orientation)
+        return {
+            **parsed,
+            "labels": RadarProcessor.normalize_labels(
+                getattr(data, "groundtruth", None),
+                point_count,
+            ),
+            "timestamp": int(getattr(data, "time_stamp", 0)),
+            "pose": {
+                "x": float(kin.position.x_val),
+                "y": float(kin.position.y_val),
+                "z": float(kin.position.z_val),
+                "roll": float(roll),
+                "pitch": float(pitch),
+                "yaw": float(yaw),
+                "qx": float(kin.orientation.x_val),
+                "qy": float(kin.orientation.y_val),
+                "qz": float(kin.orientation.z_val),
+                "qw": float(kin.orientation.w_val),
+            },
+        }
+
+    def set_sensor_debug_visualization(self, sensor_name: str, enabled: bool) -> None:
+        """Toggle the matching Unreal sensor debug box through AirSim.
+
+        AirSim을 통해 해당 언리얼 센서 디버그 박스를 켜거나 끕니다.
+        """
+        console_variables = {
+            "lidar": "autodrone.LidarDebug",
+            "radar": "autodrone.RadarDebug",
+        }
+        normalized = str(sensor_name).strip().lower()
+        if normalized not in console_variables:
+            raise ValueError(f"지원하지 않는 센서 디버그 표시: {sensor_name}")
+        command = f"{console_variables[normalized]} {1 if enabled else 0}"
+        if not self._require_client().simRunConsoleCommand(command):
+            raise RuntimeError(f"언리얼 콘솔 명령을 실행하지 못했습니다: {command}")
 
     def takeoff(self, altitude_m: float) -> None:
         client = self._require_client()
@@ -230,7 +338,7 @@ class AirSimController:
         normal_z: float,
         altitude_m: float,
         escape_altitude_m: float,
-        retreat_distance_m: float = 3.0,
+        retreat_distance_m: float = 4.5,
     ) -> None:
         """Back away from a collision, then execute the replanned path.
 
@@ -239,7 +347,11 @@ class AirSimController:
         client = self._require_client()
         client.enableApiControl(True, vehicle_name=self.vehicle_name)
         client.cancelLastTask(vehicle_name=self.vehicle_name)
-        client.hoverAsync(vehicle_name=self.vehicle_name).join()
+        # Do not wait indefinitely for hover while the collision solver is
+        # holding the vehicle against a surface. The finite escape command
+        # below becomes the new active task immediately.
+        # 충돌 솔버가 기체를 벽에 붙잡은 상태에서 hover 완료를 무기한 기다리지
+        # 않습니다. 아래의 유한 시간 탈출 명령을 즉시 새 작업으로 실행합니다.
         if abs(float(normal_z)) >= 0.55:
             # Ceiling normals point down in NED, so moving along the normal
             # lowers altitude. Floor normals perform the opposite escape.
@@ -282,7 +394,6 @@ class AirSimController:
                 yaw_mode=airsim.YawMode(False, 0),
                 vehicle_name=self.vehicle_name,
             ).join()
-        client.hoverAsync(vehicle_name=self.vehicle_name).join()
         self.move_path(points, speed_mps)
 
     def land(self) -> None:
@@ -324,7 +435,7 @@ class AirSimController:
             "collision_normal_z": float(collision.normal.z_val),
         }
 
-    def camera_images(self) -> dict[str, bytes]:
+    def camera_images(self) -> dict[str, object]:
         requests = [
             airsim.ImageRequest("0", airsim.ImageType.Scene, False, True),
             airsim.ImageRequest("0", airsim.ImageType.DepthVis, False, True),
@@ -332,11 +443,30 @@ class AirSimController:
         ]
         responses = self._require_client().simGetImages(requests, vehicle_name=self.vehicle_name)
         names = ("RGB", "Depth", "Segmentation")
-        return {
+        images: dict[str, object] = {
             name: bytes(response.image_data_uint8)
             for name, response in zip(names, responses)
             if response.image_data_uint8
         }
+        if self._enemy_detection_ready and responses:
+            try:
+                raw_detections = self._require_client().simGetDetections(
+                    "0",
+                    airsim.ImageType.Scene,
+                    vehicle_name=self.vehicle_name,
+                )
+                scene_response = responses[0]
+                images["_detections"] = TargetDetector.normalize(
+                    raw_detections or [],
+                    int(scene_response.width),
+                    int(scene_response.height),
+                )
+            except Exception as exc:
+                self._enemy_detection_ready = False
+                self._enemy_detection_error = str(exc)
+        if self._enemy_detection_error:
+            images["_detection_error"] = self._enemy_detection_error
+        return images
 
     def lidar_points(self) -> np.ndarray:
         points, _pose = self.lidar_snapshot()
