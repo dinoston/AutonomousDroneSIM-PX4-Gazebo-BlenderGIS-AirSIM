@@ -40,7 +40,10 @@ class CameraPanel(QFrame):
             font.setPointSize(10)
             painter.setFont(font)
             for detection in detections:
-                is_human = detection.get("target_kind") == "human"
+                target_kind = detection.get("target_kind")
+                is_human = target_kind == "human"
+                is_bird = target_kind == "bird"
+                short_target_label = "HUMAN" if is_human else ("BIRD" if is_bird else "DRONE")
                 draw_lidar_box = bool(detection.get("lidar_visible", True))
                 draw_radar_box = bool(detection.get("radar_confirmed", False))
                 if not draw_lidar_box and not draw_radar_box:
@@ -71,7 +74,7 @@ class CameraPanel(QFrame):
                         radar_y_max - radar_y_min,
                     )
                     radar_label = (
-                        f'RADAR {"HUMAN" if is_human else "DRONE"} '
+                        f"RADAR {short_target_label} "
                         f'{float(detection.get("radar_distance_m", 0.0)):.1f}m'
                     )
                     radar_text_y = max(16, radar_y_min - 5)
@@ -86,11 +89,15 @@ class CameraPanel(QFrame):
                     painter.drawText(radar_x_min + 3, radar_text_y, radar_label)
 
                 if draw_lidar_box:
-                    lidar_color = QColor("#35d66f") if is_human else QColor("#ff3b4f")
+                    lidar_color = (
+                        QColor("#35d66f")
+                        if is_human or is_bird
+                        else QColor("#ff3b4f")
+                    )
                     painter.setPen(QPen(lidar_color, 3))
                     painter.drawRect(x_min, y_min, x_max - x_min, y_max - y_min)
                     label = (
-                        f'LIDAR {"HUMAN" if is_human else "ENEMY DRONE"} '
+                        f"LIDAR {short_target_label if is_human or is_bird else 'ENEMY DRONE'} "
                         f'{float(detection.get("distance_m", 0.0)):.1f}m'
                     )
                     text_y = max(16, y_min - 5)
@@ -99,7 +106,9 @@ class CameraPanel(QFrame):
                         text_y - 15,
                         max(100, len(label) * 7),
                         18,
-                        QColor(21, 130, 67, 220) if is_human else QColor(180, 0, 20, 210),
+                        QColor(21, 130, 67, 220)
+                        if is_human or is_bird
+                        else QColor(180, 0, 20, 210),
                     )
                     painter.setPen(QPen(QColor("white"), 1))
                     painter.drawText(x_min + 3, text_y, label)

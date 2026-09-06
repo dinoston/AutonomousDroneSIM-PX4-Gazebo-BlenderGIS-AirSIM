@@ -83,3 +83,16 @@ def test_human_radar_returns_build_a_human_track() -> None:
 
     assert len(tracks) == 1
     assert tracks[0]["target_kind"] == "human"
+
+
+def test_flock_radar_returns_build_a_bird_track() -> None:
+    tracks = RadarProcessor.build_enemy_tracks(
+        np.asarray([[90.0, 3.0, -20.0], [90.2, 3.1, -19.8]], dtype=np.float32),
+        ["FlockCharacter_4", "FlockCharacter_4"],
+        np.asarray([92.0, 92.2], dtype=np.float32),
+        np.asarray([-12.0, -12.5], dtype=np.float32),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+
+    assert len(tracks) == 1
+    assert tracks[0]["target_kind"] == "bird"

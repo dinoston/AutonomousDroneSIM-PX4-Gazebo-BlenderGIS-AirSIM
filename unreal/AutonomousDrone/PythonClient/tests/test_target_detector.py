@@ -66,3 +66,12 @@ def test_human_blueprint_is_classified_as_human() -> None:
     detection = TargetDetector.normalize([raw], 640, 480)[0]
 
     assert detection["target_kind"] == "human"
+
+
+def test_flock_character_is_classified_as_bird() -> None:
+    raw = _raw_detection()
+    raw.name = "FlockCharacter_12"
+
+    detection = TargetDetector.normalize([raw], 640, 480)[0]
+
+    assert detection["target_kind"] == "bird"

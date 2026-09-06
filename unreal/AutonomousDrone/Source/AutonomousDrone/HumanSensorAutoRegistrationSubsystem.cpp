@@ -2,6 +2,7 @@
 
 #include "HumanSensorAutoRegistrationSubsystem.h"
 
+#include "BirdSensorTargetComponent.h"
 #include "EngineUtils.h"
 #include "GameFramework/Character.h"
 #include "HumanSensorTargetComponent.h"
@@ -14,7 +15,7 @@ void UHumanSensorAutoRegistrationSubsystem::Tick(float DeltaTime)
 		return;
 	}
 	ScanAccumulator = 0.0f;
-	RegisterHumanCharacters();
+	RegisterSensorTargets();
 }
 
 TStatId UHumanSensorAutoRegistrationSubsystem::GetStatId() const
@@ -30,7 +31,7 @@ bool UHumanSensorAutoRegistrationSubsystem::DoesSupportWorldType(
 	return WorldType == EWorldType::Game || WorldType == EWorldType::PIE;
 }
 
-void UHumanSensorAutoRegistrationSubsystem::RegisterHumanCharacters()
+void UHumanSensorAutoRegistrationSubsystem::RegisterSensorTargets()
 {
 	UWorld* World = GetWorld();
 	if (World == nullptr)
@@ -38,33 +39,52 @@ void UHumanSensorAutoRegistrationSubsystem::RegisterHumanCharacters()
 		return;
 	}
 
-	for (TActorIterator<ACharacter> It(World); It; ++It)
+	for (TActorIterator<AActor> It(World); It; ++It)
 	{
-		ACharacter* Character = *It;
-		if (Character == nullptr || Character->FindComponentByClass<UHumanSensorTargetComponent>() != nullptr)
+		AActor* Actor = *It;
+		if (Actor == nullptr)
 		{
 			continue;
 		}
 
-		// Existing migrated NPCs use BP_AINormalPeople_Drone. The explicit tag
-		// also supports any future human Blueprint without relying on its name.
-		// 현재 마이그레이션 NPC는 BP_AINormalPeople_Drone 이름을 사용합니다.
-		// 향후 다른 사람 BP는 HumanTarget 태그를 지정하면 이름에 의존하지 않습니다.
-		const bool bRecognizedHuman = Character->ActorHasTag(TEXT("HumanTarget"))
-			|| Character->GetName().Contains(TEXT("AINormalPeople"), ESearchCase::IgnoreCase);
-		if (!bRecognizedHuman)
+		const FString ActorName = Actor->GetName();
+		const FString ClassName = Actor->GetClass()->GetName();
+		const bool bRecognizedHuman = Actor->IsA<ACharacter>()
+			&& (Actor->ActorHasTag(TEXT("HumanTarget"))
+				|| ActorName.Contains(TEXT("AINormalPeople"), ESearchCase::IgnoreCase));
+		if (bRecognizedHuman
+			&& Actor->FindComponentByClass<UHumanSensorTargetComponent>() == nullptr)
 		{
-			continue;
+			UHumanSensorTargetComponent* HumanComponent = NewObject<UHumanSensorTargetComponent>(
+				Actor,
+				UHumanSensorTargetComponent::StaticClass(),
+				TEXT("HumanSensorTarget_Auto"));
+			if (HumanComponent != nullptr)
+			{
+				Actor->AddInstanceComponent(HumanComponent);
+				HumanComponent->RegisterComponent();
+			}
 		}
 
-		UHumanSensorTargetComponent* SensorComponent = NewObject<UHumanSensorTargetComponent>(
-			Character,
-			UHumanSensorTargetComponent::StaticClass(),
-			TEXT("HumanSensorTarget_Auto"));
-		if (SensorComponent != nullptr)
+		const bool bRecognizedBird = Actor->ActorHasTag(TEXT("BirdTarget"))
+			|| ActorName.Contains(TEXT("FlockCharacter"), ESearchCase::IgnoreCase)
+			|| ClassName.Contains(TEXT("FlockCharacter"), ESearchCase::IgnoreCase)
+			|| ActorName.Contains(TEXT("BoidCharacter"), ESearchCase::IgnoreCase)
+			|| ClassName.Contains(TEXT("BoidCharacter"), ESearchCase::IgnoreCase)
+			|| ActorName.Contains(TEXT("Crow"), ESearchCase::IgnoreCase)
+			|| ClassName.Contains(TEXT("Crow"), ESearchCase::IgnoreCase);
+		if (bRecognizedBird
+			&& Actor->FindComponentByClass<UBirdSensorTargetComponent>() == nullptr)
 		{
-			Character->AddInstanceComponent(SensorComponent);
-			SensorComponent->RegisterComponent();
+			UBirdSensorTargetComponent* BirdComponent = NewObject<UBirdSensorTargetComponent>(
+				Actor,
+				UBirdSensorTargetComponent::StaticClass(),
+				TEXT("BirdSensorTarget_Auto"));
+			if (BirdComponent != nullptr)
+			{
+				Actor->AddInstanceComponent(BirdComponent);
+				BirdComponent->RegisterComponent();
+			}
 		}
 	}
 }

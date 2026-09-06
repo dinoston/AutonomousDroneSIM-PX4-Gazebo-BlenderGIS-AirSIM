@@ -1067,9 +1067,13 @@ class MissionControlWindow(QMainWindow):
                 detection.get("target_kind") == "human"
                 for detection in detections
             )
-            drone_count = len(detections) - human_count
+            bird_count = sum(
+                detection.get("target_kind") == "bird"
+                for detection in detections
+            )
+            drone_count = len(detections) - human_count - bird_count
             self.telemetry_labels["enemy"].setText(
-                f"사람 {human_count}명 · 드론 {drone_count}대 · "
+                f"사람 {human_count}명 · 새 {bird_count}마리 · 드론 {drone_count}대 · "
                 f"최근접 {closest_distance:.1f} m"
             )
         else:
@@ -1246,10 +1250,14 @@ class MissionControlWindow(QMainWindow):
                 track.get("target_kind") == "human"
                 for track in tracks
             )
-            drone_count = len(tracks) - human_count
+            bird_count = sum(
+                track.get("target_kind") == "bird"
+                for track in tracks
+            )
+            drone_count = len(tracks) - human_count - bird_count
             self.telemetry_labels["radar"].setText(
                 f'{len(local):,} returns · 사람 {human_count}명 · '
-                f'드론 {drone_count}대 · '
+                f'새 {bird_count}마리 · 드론 {drone_count}대 · '
                 f'{float(closest["distance_m"]):.1f} m'
             )
         else:

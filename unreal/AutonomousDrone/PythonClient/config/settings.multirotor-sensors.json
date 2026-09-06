@@ -73,7 +73,7 @@
           "AttenuationPerDistance": 0.01,
           "AttenuationPerReflection": 1,
           "AttenuationLimit": -100,
-          "DistanceLimit": 200,
+          "DistanceLimit": 1000,
           "ReflectionLimit": 2,
           "ReflectionDistanceLimit": 0.4,
           "ReflectionOpeningAngle": 10,

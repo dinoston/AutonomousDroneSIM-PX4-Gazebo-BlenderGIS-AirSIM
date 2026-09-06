@@ -29,6 +29,13 @@ class RadarProcessor:
         "ch01",
         "ch02",
     )
+    BIRD_NAME_TOKENS = (
+        "flockcharacter",
+        "boidcharacter",
+        "birdtarget",
+        "bird",
+        "crow",
+    )
 
     @classmethod
     def parse_active_echo(cls, values: object) -> dict[str, np.ndarray]:
@@ -116,6 +123,8 @@ class RadarProcessor:
         lowered = str(label).casefold().replace("_", "")
         if any(token.replace("_", "") in lowered for token in cls.HUMAN_NAME_TOKENS):
             return "human"
+        if any(token.replace("_", "") in lowered for token in cls.BIRD_NAME_TOKENS):
+            return "bird"
         if any(token.replace("_", "") in lowered for token in cls.ENEMY_NAME_TOKENS):
             return "enemy_drone"
         return None

@@ -7,8 +7,8 @@
 #include "HumanSensorAutoRegistrationSubsystem.generated.h"
 
 /**
- * Automatically equips migrated AI people with the sensor target component.
- * 마이그레이션한 AI 사람에게 센서 표적 컴포넌트를 자동으로 부착합니다.
+ * Automatically equips people and flocking birds with sensor target components.
+ * AI 사람과 군집 새에 센서 표적 컴포넌트를 자동으로 부착합니다.
  */
 UCLASS()
 class AUTONOMOUSDRONE_API UHumanSensorAutoRegistrationSubsystem : public UTickableWorldSubsystem
@@ -21,7 +21,7 @@ public:
 	virtual bool DoesSupportWorldType(EWorldType::Type WorldType) const override;
 
 private:
-	void RegisterHumanCharacters();
+	void RegisterSensorTargets();
 
 	float ScanAccumulator = 0.0f;
 };

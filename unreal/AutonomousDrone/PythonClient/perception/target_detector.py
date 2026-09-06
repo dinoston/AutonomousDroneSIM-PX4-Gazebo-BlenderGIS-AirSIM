@@ -26,6 +26,13 @@ class TargetDetector:
         "ch01",
         "ch02",
     )
+    BIRD_NAME_TOKENS = (
+        "flockcharacter",
+        "boidcharacter",
+        "birdtarget",
+        "bird",
+        "crow",
+    )
 
     @classmethod
     def target_kind(cls, name: object) -> str:
@@ -36,6 +43,8 @@ class TargetDetector:
         lowered = str(name).casefold().replace("_", "")
         if any(token.replace("_", "") in lowered for token in cls.HUMAN_NAME_TOKENS):
             return "human"
+        if any(token.replace("_", "") in lowered for token in cls.BIRD_NAME_TOKENS):
+            return "bird"
         return "enemy_drone"
 
     @staticmethod

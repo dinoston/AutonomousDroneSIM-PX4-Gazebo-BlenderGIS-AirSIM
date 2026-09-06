@@ -51,9 +51,9 @@ class AirSimController:
         self._configure_enemy_detection()
 
     def _configure_enemy_detection(self) -> None:
-        """Register simulator filters for enemy drones and human characters.
+        """Register simulator filters for drones, people, and flocking birds.
 
-        적 드론과 사람 Character를 찾도록 시뮬레이터 이름 필터를 등록합니다.
+        적 드론, 사람, 군집 새를 찾도록 시뮬레이터 이름 필터를 등록합니다.
         """
         client = self._require_client()
         self._enemy_detection_ready = False
@@ -83,6 +83,10 @@ class AirSimController:
                 "*HumanTarget*",
                 "*Ch01*",
                 "*Ch02*",
+                "*FlockCharacter*",
+                "*BoidCharacter*",
+                "*BirdTarget*",
+                "*Crow*",
             ):
                 client.simAddDetectionFilterMeshName(
                     "0",
