@@ -154,7 +154,10 @@ void UBirdSensorTargetComponent::UpdateDetection(float DeltaTime)
 	const FColor RayColor = !bBirdDetected
 		? FColor::Yellow
 		: (bDrawLidarBox ? FColor::Green : FColor(36, 148, 255));
-	DrawDebugLine(World, RayStart, VisibleRayEnd, RayColor, false, DrawDuration, 0, 1.0f);
+	if (IsBirdDebugSensorEnabled(TEXT("autodrone.SensorRayDebug")))
+	{
+		DrawDebugLine(World, RayStart, VisibleRayEnd, RayColor, false, DrawDuration, 0, 1.0f);
+	}
 	if (bBirdDetected)
 	{
 		DrawDetectedBird(DrawDuration, bDrawLidarBox, bDrawRadarBox);

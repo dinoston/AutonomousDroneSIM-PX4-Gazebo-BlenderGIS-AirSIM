@@ -214,6 +214,7 @@ class AirSimController:
         console_variables = {
             "lidar": "autodrone.LidarDebug",
             "radar": "autodrone.RadarDebug",
+            "sensor_ray": "autodrone.SensorRayDebug",
         }
         normalized = str(sensor_name).strip().lower()
         if normalized not in console_variables:

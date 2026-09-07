@@ -15,9 +15,10 @@
 namespace
 {
 	// Mission Control changes these console variables through AirSim's
-	// simRunConsoleCommand API. Both visualizations start enabled.
+	// simRunConsoleCommand API. Sensor boxes start enabled, while the rays
+	// start disabled so normal play and captured RGB frames stay clean.
 	// Mission Control은 AirSim simRunConsoleCommand API로 이 콘솔 변수를
-	// 변경하며, 두 디버그 표시는 기본적으로 켜집니다.
+	// 변경합니다. 센서 박스는 기본 ON이고 감지선은 기본 OFF입니다.
 	TAutoConsoleVariable<int32> CVarAutonomousDroneLidarDebug(
 		TEXT("autodrone.LidarDebug"),
 		1,
@@ -28,6 +29,12 @@ namespace
 		TEXT("autodrone.RadarDebug"),
 		1,
 		TEXT("Show the larger blue Radar enemy box (0=off, 1=on). / 더 큰 파란 Radar 적 박스를 표시합니다."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarAutonomousDroneSensorRayDebug(
+		TEXT("autodrone.SensorRayDebug"),
+		0,
+		TEXT("Show sensor line-of-sight debug rays (0=off, 1=on). / 센서 시야 디버그 선을 표시합니다."),
 		ECVF_Default);
 }
 
@@ -357,6 +364,7 @@ void AFlyingNPCPawn::UpdateProximityDetection(float DeltaSeconds)
 	DetectedDistanceCm = FVector::Distance(RayStart, RayEnd);
 	const bool bLidarDebugEnabled = CVarAutonomousDroneLidarDebug.GetValueOnGameThread() != 0;
 	const bool bRadarDebugEnabled = CVarAutonomousDroneRadarDebug.GetValueOnGameThread() != 0;
+	const bool bSensorRayDebugEnabled = CVarAutonomousDroneSensorRayDebug.GetValueOnGameThread() != 0;
 	const bool bWithinLidarRange = DetectedDistanceCm <= DetectionRangeCm;
 	const bool bWithinRadarRange = DetectedDistanceCm <= RadarDetectionRangeCm;
 	if (!bWithinLidarRange && !bWithinRadarRange)
@@ -392,15 +400,18 @@ void AFlyingNPCPawn::UpdateProximityDetection(float DeltaSeconds)
 		const FColor RayColor = !bTargetDetected
 			? FColor::Yellow
 			: (bDrawLidarBox ? FColor::Red : FColor(36, 148, 255));
-		DrawDebugLine(
-			World,
-			RayStart,
-			VisibleRayEnd,
-			RayColor,
-			false,
-			DrawDuration,
-			0,
-			2.0f);
+		if (bSensorRayDebugEnabled)
+		{
+			DrawDebugLine(
+				World,
+				RayStart,
+				VisibleRayEnd,
+				RayColor,
+				false,
+				DrawDuration,
+				0,
+				2.0f);
+		}
 		if (bTargetDetected)
 		{
 			DrawDetectedTarget(DrawDuration, bDrawLidarBox, bDrawRadarBox);

@@ -142,7 +142,10 @@ void UHumanSensorTargetComponent::UpdateDetection(float DeltaTime)
 	const FColor RayColor = !bHumanDetected
 		? FColor::Yellow
 		: (bDrawLidarBox ? FColor::Green : FColor(36, 148, 255));
-	DrawDebugLine(World, RayStart, VisibleRayEnd, RayColor, false, DrawDuration, 0, 2.0f);
+	if (IsDebugSensorEnabled(TEXT("autodrone.SensorRayDebug")))
+	{
+		DrawDebugLine(World, RayStart, VisibleRayEnd, RayColor, false, DrawDuration, 0, 2.0f);
+	}
 	if (bHumanDetected)
 	{
 		DrawDetectedHuman(DrawDuration, bDrawLidarBox, bDrawRadarBox);

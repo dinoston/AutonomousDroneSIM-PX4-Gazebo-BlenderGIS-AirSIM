@@ -69,6 +69,7 @@ class AirSimWorker(QThread):
         self._stream_sensors = True
         self._lidar_enabled = True
         self._radar_enabled = True
+        self._sensor_ray_debug_enabled = False
         self._last_sensor_error = 0.0
 
     def submit(self, name: str, *args, priority: int = 10) -> None:
@@ -89,6 +90,16 @@ class AirSimWorker(QThread):
         self._radar_enabled = bool(enabled)
         if self.controller.connected:
             self.submit("sensor_debug", "radar", self._radar_enabled, priority=2)
+
+    def set_sensor_ray_debug_enabled(self, enabled: bool) -> None:
+        self._sensor_ray_debug_enabled = bool(enabled)
+        if self.controller.connected:
+            self.submit(
+                "sensor_debug",
+                "sensor_ray",
+                self._sensor_ray_debug_enabled,
+                priority=2,
+            )
 
     def run(self) -> None:
         next_telemetry = 0.0
@@ -137,6 +148,9 @@ class AirSimWorker(QThread):
                     )
                     self.controller.set_sensor_debug_visualization(
                         "radar", self._radar_enabled
+                    )
+                    self.controller.set_sensor_debug_visualization(
+                        "sensor_ray", self._sensor_ray_debug_enabled
                     )
                     self.connection_changed.emit(True, "연결됨")
                 elif name == "disconnect":
@@ -296,11 +310,17 @@ class MissionControlWindow(QMainWindow):
         self.radar_checkbox.setChecked(True)
         self.radar_checkbox.toggled.connect(self.worker.set_radar_enabled)
         self.radar_checkbox.toggled.connect(self._on_radar_toggled)
+        self.sensor_ray_debug_checkbox = QCheckBox("센서 디버그 선")
+        self.sensor_ray_debug_checkbox.setChecked(False)
+        self.sensor_ray_debug_checkbox.toggled.connect(
+            self.worker.set_sensor_ray_debug_enabled
+        )
         header.addWidget(title)
         header.addStretch()
         header.addWidget(self.sensor_checkbox)
         header.addWidget(self.lidar_checkbox)
         header.addWidget(self.radar_checkbox)
+        header.addWidget(self.sensor_ray_debug_checkbox)
         header.addWidget(self.status_indicator)
         header.addWidget(self.connect_button)
         root.addLayout(header)
