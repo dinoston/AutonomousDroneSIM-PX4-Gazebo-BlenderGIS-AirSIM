@@ -140,3 +140,20 @@ def test_astar_does_not_cut_through_a_blocked_diagonal_corner() -> None:
     path = planner._astar(start, goal, blocked)
     assert len(path) > 2
     assert not planner._line_clear(start, goal, blocked)
+
+
+def test_start_footprint_returns_do_not_trap_the_vehicle() -> None:
+    planner = AltitudeGridPlanner(
+        PlannerConfig(half_extent_m=20.0, resolution_m=1.0, drone_radius_m=2.0)
+    )
+    start = planner._to_cell((0.0, 0.0))
+    goal = planner._to_cell((10.0, 0.0))
+    blocked = {
+        (start[0] + dx, start[1] + dy)
+        for dx in range(-2, 3)
+        for dy in range(-2, 3)
+        if dx or dy
+    }
+    path = planner._astar(start, goal, blocked)
+    assert path[0] == start
+    assert path[-1] == goal

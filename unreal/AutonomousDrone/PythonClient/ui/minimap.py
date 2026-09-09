@@ -32,6 +32,8 @@ class MiniMapWidget(QWidget):
         self.drone_xy = (0.0, 0.0)
         self.spawn_xy = (0.0, 0.0)
         self.target_xy: tuple[float, float] | None = None
+        self.route_waypoints: list[tuple[float, float, float]] = []
+        self.patrol_waypoints: list[tuple[float, float, float]] = []
         self.selection_mode = "target"
         self.obstacles = np.empty((0, 3), dtype=np.float32)
         self.path: list[tuple[float, float, float]] = []
@@ -65,6 +67,22 @@ class MiniMapWidget(QWidget):
 
     def set_path(self, path: list[tuple[float, float, float]]) -> None:
         self.path = list(path)
+        self.update()
+
+    def set_route_waypoints(
+        self,
+        waypoints: list[tuple[float, float, float]],
+    ) -> None:
+        """Show the user-defined B, C, D... reservation points."""
+        self.route_waypoints = list(waypoints)
+        self.update()
+
+    def set_patrol_waypoints(
+        self,
+        waypoints: list[tuple[float, float, float]],
+    ) -> None:
+        """Show the current autonomous central-coverage cycle."""
+        self.patrol_waypoints = list(waypoints)
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -158,13 +176,15 @@ class MiniMapWidget(QWidget):
             painter.restore()
         self._draw_grid(painter)
         self._draw_obstacles(painter)
+        self._draw_route_waypoints(painter)
+        self._draw_patrol_waypoints(painter)
         self._draw_path(painter)
         self._draw_marker(painter, self.spawn_xy, QColor("#66a8ff"), "SPAWN A")
         self._draw_marker(painter, self.drone_xy, QColor("#51d88a"), "DRONE")
         if self.target_xy is not None:
             self._draw_marker(painter, self.target_xy, QColor("#ffcc55"), "B")
         painter.setPen(QColor("#9fb1c5"))
-        mode = "스폰 A" if self.selection_mode == "spawn" else "목표 B"
+        mode = "스폰 A" if self.selection_mode == "spawn" else "경유지 후보"
         zoom = self._base_half_extent_m / self.half_extent_m
         painter.drawText(12, 22, f"N(+X) ↑    E(+Y) →    현재 선택: {mode}    줌: {zoom:.1f}x")
 
@@ -211,6 +231,54 @@ class MiniMapWidget(QWidget):
         for x_m, y_m, _altitude in self.path:
             draw_path.lineTo(self._world_to_pixel((x_m, y_m)))
         painter.drawPath(draw_path)
+
+    def _draw_route_waypoints(self, painter: QPainter) -> None:
+        if not self.route_waypoints:
+            return
+        route_pen = QPen(QColor(255, 204, 85, 190), 2)
+        route_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(route_pen)
+        route_path = QPainterPath(self._world_to_pixel(self.spawn_xy))
+        for x_m, y_m, _altitude in self.route_waypoints:
+            route_path.lineTo(self._world_to_pixel((x_m, y_m)))
+        painter.drawPath(route_path)
+        for index, (x_m, y_m, altitude) in enumerate(self.route_waypoints):
+            label = self._route_label(index)
+            self._draw_marker(
+                painter,
+                (x_m, y_m),
+                QColor("#ffcc55"),
+                f"{label} · {altitude:.1f}m",
+            )
+
+    def _draw_patrol_waypoints(self, painter: QPainter) -> None:
+        if not self.patrol_waypoints:
+            return
+        patrol_color = QColor(65, 224, 210, 205)
+        patrol_pen = QPen(patrol_color, 2)
+        patrol_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(patrol_pen)
+        patrol_path = QPainterPath(self._world_to_pixel(self.drone_xy))
+        for x_m, y_m, _altitude in self.patrol_waypoints:
+            patrol_path.lineTo(self._world_to_pixel((x_m, y_m)))
+        painter.drawPath(patrol_path)
+        for index, (x_m, y_m, _altitude) in enumerate(self.patrol_waypoints):
+            self._draw_marker(
+                painter,
+                (x_m, y_m),
+                patrol_color,
+                f"정찰 {index + 1}",
+            )
+
+    @staticmethod
+    def _route_label(index: int) -> str:
+        """Return B, C ... Z, AA style labels (A is the spawn point)."""
+        value = max(0, int(index)) + 2
+        label = ""
+        while value:
+            value, remainder = divmod(value - 1, 26)
+            label = chr(ord("A") + remainder) + label
+        return label
 
     def _draw_marker(self, painter: QPainter, xy: tuple[float, float], color: QColor, label: str) -> None:
         point = self._world_to_pixel(xy)

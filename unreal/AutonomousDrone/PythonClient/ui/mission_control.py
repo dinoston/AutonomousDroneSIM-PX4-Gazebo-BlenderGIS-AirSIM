@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import queue
 import sys
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -101,6 +103,26 @@ class AirSimWorker(QThread):
                 priority=2,
             )
 
+    def discard_pending_navigation(self) -> None:
+        """Remove queued movement commands before a stop or landing command."""
+        retained: list[tuple] = []
+        navigation_commands = {
+            "move",
+            "path",
+            "recovery_path",
+            "takeoff",
+            "land",
+        }
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                break
+            if command[2] not in navigation_commands:
+                retained.append(command)
+        for command in retained:
+            self._commands.put(command)
+
     def run(self) -> None:
         next_telemetry = 0.0
         next_images = 0.0
@@ -171,7 +193,9 @@ class AirSimWorker(QThread):
                 elif name == "recovery_path":
                     self.controller.recover_and_move_path(*args)
                 elif name == "land":
-                    self.controller.land()
+                    self.controller.land(*args)
+                elif name == "mission_stop":
+                    self.controller.emergency_stop()
                 elif name == "emergency":
                     self.controller.emergency_stop()
                 elif name == "sensor_debug":
@@ -226,7 +250,7 @@ class AirSimWorker(QThread):
 class MissionControlWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Autonomous Drone Mission Control · Avoidance v8")
+        self.setWindowTitle("Autonomous Drone Mission Control · Avoidance v9")
         self.resize(1500, 920)
         self.settings = QSettings("AutonomousDrone", "MissionControl")
         self._connected = False
@@ -251,6 +275,17 @@ class MissionControlWindow(QMainWindow):
         self._telemetry: dict | None = None
         self._planned_path: list[tuple[float, float, float]] = []
         self._active_target: tuple[float, float, float] | None = None
+        self._route_waypoints: list[tuple[float, float, float]] = []
+        self._route_queue: list[tuple[float, float, float]] = []
+        self._route_running = False
+        self._active_route_index: int | None = None
+        self._autonomous_patrol_running = False
+        self._autonomous_patrol_end_time = 0.0
+        self._autonomous_patrol_visited = 0
+        self._patrol_target_queue: list[tuple[float, float, float]] = []
+        self._patrol_cycle_targets: list[tuple[float, float, float]] = []
+        self._patrol_cycle_number = 0
+        self._patrol_rng = np.random.default_rng()
         self._pending_descent_altitude: float | None = None
         self._pending_descent_safe_altitude: float | None = None
         self._pending_descent_commanded = False
@@ -345,22 +380,25 @@ class MissionControlWindow(QMainWindow):
         self.arm_button = QPushButton("ARM")
         self.disarm_button = QPushButton("DISARM")
         self.takeoff_button = QPushButton("이륙")
-        self.hover_button = QPushButton("호버링")
+        self.hover_button = QPushButton("미션 중지·호버링")
+        self.cancel_route_button = QPushButton("예약 목록 취소")
         self.land_button = QPushButton("착륙")
         self.emergency_button = QPushButton("긴급 정지")
         self.emergency_button.setObjectName("emergency")
         self.arm_button.clicked.connect(lambda: self.worker.submit("arm", True))
         self.disarm_button.clicked.connect(lambda: self.worker.submit("arm", False))
         self.takeoff_button.clicked.connect(self._takeoff)
-        self.hover_button.clicked.connect(lambda: self.worker.submit("hover"))
-        self.land_button.clicked.connect(lambda: self.worker.submit("land"))
-        self.emergency_button.clicked.connect(lambda: self.worker.submit("emergency", priority=0))
+        self.hover_button.clicked.connect(self._stop_active_mission)
+        self.cancel_route_button.clicked.connect(self._clear_waypoints)
+        self.land_button.clicked.connect(self._land)
+        self.emergency_button.clicked.connect(self._emergency_stop)
         flight_layout.addWidget(self.arm_button, 0, 0)
         flight_layout.addWidget(self.disarm_button, 0, 1)
         flight_layout.addWidget(self.takeoff_button, 1, 0)
-        flight_layout.addWidget(self.hover_button, 1, 1)
-        flight_layout.addWidget(self.land_button, 2, 0)
-        flight_layout.addWidget(self.emergency_button, 2, 1)
+        flight_layout.addWidget(self.land_button, 1, 1)
+        flight_layout.addWidget(self.hover_button, 2, 0)
+        flight_layout.addWidget(self.cancel_route_button, 2, 1)
+        flight_layout.addWidget(self.emergency_button, 3, 0, 1, 2)
         layout.addWidget(flight_group)
 
         destination_group = QGroupBox("목적지 · NED 기준")
@@ -377,7 +415,7 @@ class MissionControlWindow(QMainWindow):
         destination_form.addRow("이동 속도", self.speed)
         map_mode_row = QHBoxLayout()
         self.spawn_select_button = QPushButton("스폰 A 선택")
-        self.target_select_button = QPushButton("목표 B 선택")
+        self.target_select_button = QPushButton("경유지 선택")
         self.spawn_select_button.setCheckable(True)
         self.target_select_button.setCheckable(True)
         self.target_select_button.setChecked(True)
@@ -389,6 +427,18 @@ class MissionControlWindow(QMainWindow):
         self.apply_spawn_button = QPushButton("선택한 위치에 스폰 적용")
         self.apply_spawn_button.clicked.connect(self._apply_spawn)
         destination_form.addRow(self.apply_spawn_button)
+        self.route_list = QListWidget()
+        self.route_list.setMaximumHeight(86)
+        self.route_list.setToolTip("드론이 B부터 표시된 순서대로 방문합니다.")
+        destination_form.addRow("예약 경유지", self.route_list)
+        route_edit_row = QHBoxLayout()
+        self.add_waypoint_button = QPushButton("경유지 추가")
+        self.remove_waypoint_button = QPushButton("선택 삭제")
+        self.add_waypoint_button.clicked.connect(self._add_waypoint)
+        self.remove_waypoint_button.clicked.connect(self._remove_selected_waypoint)
+        route_edit_row.addWidget(self.add_waypoint_button)
+        route_edit_row.addWidget(self.remove_waypoint_button)
+        destination_form.addRow(route_edit_row)
         self.auto_replan_checkbox = QCheckBox("LiDAR 장애물 감지 시 자동 재탐색")
         self.auto_replan_checkbox.setChecked(True)
         destination_form.addRow(self.auto_replan_checkbox)
@@ -398,6 +448,20 @@ class MissionControlWindow(QMainWindow):
         self.move_button = QPushButton("A* 경로로 목표 B 이동")
         self.move_button.clicked.connect(self._move)
         destination_form.addRow(self.move_button)
+        self.route_move_button = QPushButton("A→B→C 예약 경로 비행")
+        self.route_move_button.clicked.connect(self._start_reserved_route)
+        destination_form.addRow(self.route_move_button)
+        self.patrol_duration_minutes = self._spinbox(0.5, 60.0, 5.0, " 분")
+        self.patrol_duration_minutes.setSingleStep(0.5)
+        destination_form.addRow("자율 정찰 시간", self.patrol_duration_minutes)
+        patrol_row = QHBoxLayout()
+        self.start_patrol_button = QPushButton("중앙 7구역 정찰 시작")
+        self.stop_patrol_button = QPushButton("정찰 중지")
+        self.start_patrol_button.clicked.connect(self._start_autonomous_patrol)
+        self.stop_patrol_button.clicked.connect(self._stop_autonomous_patrol)
+        patrol_row.addWidget(self.start_patrol_button)
+        patrol_row.addWidget(self.stop_patrol_button)
+        destination_form.addRow(patrol_row)
         layout.addWidget(destination_group)
 
         mission_group = QGroupBox("패턴 미션")
@@ -423,6 +487,7 @@ class MissionControlWindow(QMainWindow):
             ("LiDAR 감지", "lidar"),
             ("Radar 감지", "radar"),
             ("탐지 표적", "enemy"),
+            ("자율 정찰", "patrol"),
         ]
         for label, key in fields:
             value = QLabel("—")
@@ -510,8 +575,85 @@ class MissionControlWindow(QMainWindow):
     def _takeoff(self) -> None:
         self.worker.submit("takeoff", self.takeoff_altitude.value())
 
+    def _clear_active_mission_state(self) -> None:
+        """Cancel route state without deleting the user's reserved points."""
+        patrol_was_running = self._autonomous_patrol_running
+        visited = self._autonomous_patrol_visited
+        self._cancel_autonomous_patrol()
+        self._route_running = False
+        self._route_queue = []
+        self._active_route_index = None
+        self._active_target = None
+        self._planned_path = []
+        self._pending_descent_altitude = None
+        self._pending_descent_safe_altitude = None
+        self._pending_descent_commanded = False
+        self._obstacle_detection_count = 0
+        self._enemy_detection_count = 0
+        self.minimap.set_path([])
+        if patrol_was_running:
+            self.telemetry_labels["patrol"].setText(
+                f"중지 · 방문 {visited}곳"
+            )
+
+    def _stop_active_mission(self) -> None:
+        self._clear_active_mission_state()
+        self.worker.discard_pending_navigation()
+        self.worker.submit("mission_stop", priority=0)
+        self.message_label.setText(
+            "현재 미션을 중지하고 이 위치에서 호버링합니다. "
+            "다른 미션을 바로 시작할 수 있습니다."
+        )
+
+    def _landing_approach_altitude(self) -> float | None:
+        """Estimate a fast-descent endpoint about one metre above the surface."""
+        if self._telemetry is None or not self._latest_lidar_world.size:
+            return None
+        current_altitude = float(self._telemetry["altitude"])
+        current_x = float(self._telemetry["x"])
+        current_y = float(self._telemetry["y"])
+        points = self._latest_lidar_world
+        finite = np.all(np.isfinite(points), axis=1)
+        horizontal = np.hypot(points[:, 0] - current_x, points[:, 1] - current_y)
+        surface_altitudes = -points[:, 2]
+        underneath = (
+            finite
+            & (horizontal <= self.planner.config.drone_radius_m + 0.75)
+            & (surface_altitudes <= current_altitude - 0.5)
+            & (surface_altitudes >= -1.0)
+        )
+        if not np.any(underneath):
+            return None
+        surface_altitude = float(np.max(surface_altitudes[underneath]))
+        approach_altitude = max(0.8, surface_altitude + 1.0)
+        return min(current_altitude, approach_altitude)
+
+    def _land(self) -> None:
+        approach_altitude = self._landing_approach_altitude()
+        self._clear_active_mission_state()
+        self.worker.discard_pending_navigation()
+        self.worker.submit("land", approach_altitude, 1.5, priority=0)
+        if approach_altitude is None:
+            self.message_label.setText(
+                "하부 LiDAR 표면을 확인할 수 없어 기본 안전 착륙을 시작합니다."
+            )
+        else:
+            self.message_label.setText(
+                f"고도 {approach_altitude:.1f}m까지 1.5m/s로 접근한 뒤 착륙합니다."
+            )
+
+    def _emergency_stop(self) -> None:
+        self._clear_active_mission_state()
+        self.worker.discard_pending_navigation()
+        self.worker.submit("emergency", priority=0)
+        self.message_label.setText("모든 미션을 취소하고 긴급 호버링합니다.")
+
     def _move(self) -> None:
         try:
+            self._cancel_autonomous_patrol()
+            self._route_running = False
+            self._route_queue = []
+            self._active_route_index = None
             self._plan_and_fly(replan=False)
         except Exception as exc:
             self._on_error(f"경로계획: {exc}")
@@ -524,7 +666,7 @@ class MissionControlWindow(QMainWindow):
         self.message_label.setText(
             "미니맵에서 스폰 A를 클릭하세요."
             if is_spawn
-            else "미니맵에서 목표 B를 클릭하세요."
+            else "미니맵에서 추가할 경유지를 클릭하세요."
         )
 
     def _on_spawn_selected(self, x_m: float, y_m: float) -> None:
@@ -536,11 +678,298 @@ class MissionControlWindow(QMainWindow):
     def _on_target_selected(self, x_m: float, y_m: float) -> None:
         self.destination_x.setValue(x_m)
         self.destination_y.setValue(y_m)
+        next_label = self._route_label(len(self._route_waypoints))
+        self.message_label.setText(
+            f"경유지 {next_label} 후보: X={x_m:.1f}, Y={y_m:.1f}m · "
+            "고도를 확인하고 경유지 추가를 누르세요."
+        )
+
+    @staticmethod
+    def _route_label(index: int) -> str:
+        value = max(0, int(index)) + 2
+        label = ""
+        while value:
+            value, remainder = divmod(value - 1, 26)
+            label = chr(ord("A") + remainder) + label
+        return label
+
+    def _refresh_route_list(self) -> None:
+        self.route_list.clear()
+        for index, (x_m, y_m, altitude_m) in enumerate(self._route_waypoints):
+            label = self._route_label(index)
+            self.route_list.addItem(
+                f"{label}  X {x_m:.1f} · Y {y_m:.1f} · 고도 {altitude_m:.1f} m"
+            )
+        self.minimap.set_route_waypoints(self._route_waypoints)
+
+    def _add_waypoint(self) -> None:
+        waypoint = (
+            float(self.destination_x.value()),
+            float(self.destination_y.value()),
+            float(self.destination_altitude.value()),
+        )
+        if self._route_waypoints:
+            previous = self._route_waypoints[-1]
+            if math.dist(previous, waypoint) < 0.1:
+                self.message_label.setText("마지막 경유지와 같은 위치입니다.")
+                return
+        self._route_waypoints.append(waypoint)
+        self._refresh_route_list()
+        label = self._route_label(len(self._route_waypoints) - 1)
+        self.message_label.setText(
+            f"경유지 {label} 예약: X={waypoint[0]:.1f}, "
+            f"Y={waypoint[1]:.1f}, 고도={waypoint[2]:.1f}m"
+        )
+
+    def _remove_selected_waypoint(self) -> None:
+        row = self.route_list.currentRow()
+        if row < 0 or row >= len(self._route_waypoints):
+            self.message_label.setText("삭제할 경유지를 목록에서 선택하세요.")
+            return
+        self._route_waypoints.pop(row)
+        self._refresh_route_list()
+        self.message_label.setText("선택한 경유지를 삭제하고 순서를 다시 정리했습니다.")
+
+    def _clear_waypoints(self) -> None:
+        route_was_running = self._route_running
+        if route_was_running:
+            self._clear_active_mission_state()
+            self.worker.discard_pending_navigation()
+            self.worker.submit("mission_stop", priority=0)
+        self._route_waypoints = []
+        self._route_queue = []
+        self._route_running = False
+        self._active_route_index = None
+        self._refresh_route_list()
+        self.message_label.setText(
+            "예약 경로를 취소하고 현재 위치에서 호버링합니다."
+            if route_was_running
+            else "B/C/D 예약 목록을 모두 취소했습니다."
+        )
+
+    def _start_reserved_route(self) -> None:
+        if self._telemetry is None:
+            self._on_error("예약 경로: 드론 위치를 아직 받지 못했습니다.")
+            return
+        if not self._route_waypoints:
+            self._on_error("예약 경로: 경유지를 하나 이상 추가하세요.")
+            return
+        self._cancel_autonomous_patrol()
+        self._route_queue = list(self._route_waypoints)
+        self._route_running = True
+        self._active_route_index = -1
+        try:
+            self._start_next_route_waypoint(reset_avoidance=True)
+        except Exception as exc:
+            self._route_running = False
+            self._on_error(f"예약 경로 생성: {exc}")
+
+    def _start_next_route_waypoint(self, reset_avoidance: bool = False) -> None:
+        if not self._route_queue:
+            self._route_running = False
+            self._active_route_index = None
+            self._active_target = None
+            self._planned_path = []
+            self.minimap.set_path([])
+            self.message_label.setText("예약 경로의 모든 경유지에 도착했습니다.")
+            return
+        target = self._route_queue.pop(0)
+        self._active_route_index = (
+            0 if self._active_route_index is None else self._active_route_index + 1
+        )
+        self.destination_x.setValue(target[0])
+        self.destination_y.setValue(target[1])
+        self.destination_altitude.setValue(target[2])
+        self._plan_and_fly(
+            replan=False,
+            target_override=target,
+            reset_avoidance=reset_avoidance,
+        )
+        label = self._route_label(self._active_route_index)
+        self.message_label.setText(
+            f"예약 경로 {label}로 이동 중 · 남은 경유지 {len(self._route_queue)}개"
+        )
+
+    def _start_autonomous_patrol(self) -> None:
+        if self._telemetry is None:
+            self._on_error("자율 정찰: 드론 위치를 아직 받지 못했습니다.")
+            return
+        self._route_running = False
+        self._route_queue = []
+        self._active_route_index = None
+        self._autonomous_patrol_running = True
+        self._autonomous_patrol_visited = 0
+        self._patrol_target_queue = []
+        self._patrol_cycle_targets = []
+        self._patrol_cycle_number = 0
+        duration_seconds = float(self.patrol_duration_minutes.value()) * 60.0
+        self._autonomous_patrol_end_time = time.monotonic() + duration_seconds
+        self.telemetry_labels["patrol"].setText(
+            f"진행 중 · {duration_seconds / 60.0:.1f}분 남음 · 방문 0곳"
+        )
+        try:
+            self._start_next_patrol_target(reset_avoidance=True)
+        except Exception as exc:
+            self._cancel_autonomous_patrol()
+            self._on_error(f"자율 정찰 시작: {exc}")
+
+    def _stop_autonomous_patrol(self) -> None:
+        if not self._autonomous_patrol_running:
+            self.message_label.setText("진행 중인 중앙 순회 정찰이 없습니다.")
+            return
+        visited = self._autonomous_patrol_visited
+        self._cancel_autonomous_patrol()
         self._active_target = None
+        self._planned_path = []
         self._pending_descent_altitude = None
         self._pending_descent_safe_altitude = None
         self._pending_descent_commanded = False
-        self.message_label.setText(f"목표 B 선택: X={x_m:.1f}, Y={y_m:.1f}m")
+        self.minimap.set_path([])
+        self.worker.submit("hover", priority=1)
+        self.telemetry_labels["patrol"].setText(f"중지 · 방문 {visited}곳")
+        self.message_label.setText(
+            f"중앙 순회 정찰을 중지했습니다 · 방문 지역 {visited}곳"
+        )
+
+    def _cancel_autonomous_patrol(self) -> None:
+        self._autonomous_patrol_running = False
+        self._autonomous_patrol_end_time = 0.0
+        self._patrol_target_queue = []
+        self._patrol_cycle_targets = []
+        if hasattr(self, "minimap"):
+            self.minimap.set_patrol_waypoints([])
+
+    def _build_patrol_sweep_targets(self) -> list[tuple[float, float, float]]:
+        """Build a repeatable central sweep with at least six distinct zones.
+
+        중앙 권역을 기준으로 서로 다른 여섯 구역 이상을 훑는 순회점을 만듭니다.
+        """
+        if self._telemetry is None:
+            return []
+        center = np.asarray(self.minimap._base_center_xy_m, dtype=np.float64)
+        current = np.asarray(
+            [float(self._telemetry["x"]), float(self._telemetry["y"])],
+            dtype=np.float64,
+        )
+        altitude = float(self.destination_altitude.value())
+        # A 105 m ring covers the central facilities while remaining feasible
+        # within a five-minute patrol at the default 3 m/s mission speed.
+        # 반경 105m 순회는 중앙 시설을 넓게 훑으면서 기본 3m/s 기준 5분 안에
+        # 최소 다섯 구역을 방문할 수 있는 길이입니다.
+        radius = min(105.0, float(self.minimap._base_half_extent_m) * 0.22)
+        sector_count = 6
+        phase = float(self._patrol_rng.uniform(0.0, 2.0 * math.pi))
+        ring = []
+        for index in range(sector_count):
+            angle = phase + 2.0 * math.pi * index / sector_count
+            radial_jitter = float(self._patrol_rng.uniform(-10.0, 10.0))
+            angular_jitter = float(self._patrol_rng.uniform(-0.06, 0.06))
+            distance = radius + radial_jitter
+            ring.append(
+                center
+                + distance
+                * np.asarray(
+                    [math.cos(angle + angular_jitter), math.sin(angle + angular_jitter)],
+                    dtype=np.float64,
+                )
+            )
+
+        # Start at the nearest sector, then sweep around the ring instead of
+        # repeatedly crossing the whole map in a random order.
+        # 현재 위치에서 가장 가까운 구역부터 원형으로 순회하여 무작위 장거리
+        # 왕복 대신 중앙 지역을 연속적으로 훑습니다.
+        nearest = min(
+            range(len(ring)),
+            key=lambda index: float(np.linalg.norm(ring[index] - current)),
+        )
+        ordered = ring[nearest:] + ring[:nearest]
+        targets = [
+            (float(point[0]), float(point[1]), altitude)
+            for point in ordered
+        ]
+        # Finish each cycle through the center, producing seven visibly
+        # different scan regions before a newly jittered cycle begins.
+        targets.append((float(center[0]), float(center[1]), altitude))
+        return targets
+
+    def _start_next_patrol_target(self, reset_avoidance: bool = False) -> None:
+        if not self._autonomous_patrol_running or self._telemetry is None:
+            return
+        last_error: Exception | None = None
+        # If a point is temporarily blocked, skip that one and continue with
+        # the rest of the coverage route. Generate at most one replacement
+        # cycle in this call so an unhealthy map cannot loop forever.
+        for cycle_attempt in range(2):
+            if not self._patrol_target_queue:
+                self._patrol_cycle_number += 1
+                self._patrol_cycle_targets = self._build_patrol_sweep_targets()
+                self._patrol_target_queue = list(self._patrol_cycle_targets)
+                self.minimap.set_patrol_waypoints(self._patrol_cycle_targets)
+            while self._patrol_target_queue:
+                target = self._patrol_target_queue.pop(0)
+                try:
+                    self._plan_and_fly(
+                        replan=False,
+                        target_override=target,
+                        reset_avoidance=reset_avoidance,
+                    )
+                    remaining_seconds = max(
+                        0.0,
+                        self._autonomous_patrol_end_time - time.monotonic(),
+                    )
+                    current_index = (
+                        len(self._patrol_cycle_targets)
+                        - len(self._patrol_target_queue)
+                    )
+                    self.message_label.setText(
+                        f"중앙 순회 정찰 {self._patrol_cycle_number}회차 · "
+                        f"구역 {current_index}/{len(self._patrol_cycle_targets)} · "
+                        f"남은 시간 {remaining_seconds / 60.0:.1f}분 · "
+                        f"방문 {self._autonomous_patrol_visited}곳"
+                    )
+                    return
+                except (RuntimeError, ValueError) as exc:
+                    last_error = exc
+                    reset_avoidance = False
+                    continue
+        raise RuntimeError(
+            f"중앙 순회 후보 14곳에서 이동 가능한 목표를 찾지 못했습니다: {last_error}"
+        )
+
+    def _update_autonomous_patrol(self) -> None:
+        if (
+            not self._autonomous_patrol_running
+            or time.monotonic() < self._autonomous_patrol_end_time
+        ):
+            return
+        visited = self._autonomous_patrol_visited
+        self._cancel_autonomous_patrol()
+        self._active_target = None
+        self._planned_path = []
+        self._pending_descent_altitude = None
+        self._pending_descent_safe_altitude = None
+        self._pending_descent_commanded = False
+        self.minimap.set_path([])
+        self.worker.submit("hover", priority=1)
+        self.telemetry_labels["patrol"].setText(f"완료 · 방문 {visited}곳")
+        self.message_label.setText(
+            f"자율 정찰 시간이 끝나 자동 호버링합니다 · 방문 지역 {visited}곳"
+        )
+
+    def _continue_autonomous_patrol(self) -> None:
+        try:
+            self._start_next_patrol_target()
+        except Exception as exc:
+            visited = self._autonomous_patrol_visited
+            self._cancel_autonomous_patrol()
+            self._active_target = None
+            self._planned_path = []
+            self.minimap.set_path([])
+            self.worker.submit("hover", priority=1)
+            self.telemetry_labels["patrol"].setText(
+                f"경로 생성 실패 · 방문 {visited}곳"
+            )
+            self._on_error(f"자율 정찰 경로 생성 실패 · 호버링: {exc}")
 
     def _apply_spawn(self) -> None:
         self.worker.submit("spawn", self._spawn_xy[0], self._spawn_xy[1], priority=2)
@@ -551,10 +980,12 @@ class MissionControlWindow(QMainWindow):
         start_override: tuple[float, float] | None = None,
         altitude_override: float | None = None,
         collision_escape: tuple[float, float, float, float, float] | None = None,
+        target_override: tuple[float, float, float] | None = None,
+        reset_avoidance: bool = True,
     ) -> None:
         if self._telemetry is None:
             raise RuntimeError("드론 위치를 아직 받지 못했습니다.")
-        if not replan:
+        if not replan and reset_avoidance:
             # A manually started mission clears constraints learned by the
             # previous route. New collisions will establish fresh limits.
             # 사용자가 새 임무를 시작하면 이전 경로에서 학습한 고도 제한을
@@ -565,10 +996,14 @@ class MissionControlWindow(QMainWindow):
                 (0, 3),
                 dtype=np.float32,
             )
-        target = (
-            self.destination_x.value(),
-            self.destination_y.value(),
-            self.destination_altitude.value(),
+        target = target_override or (
+            self._active_target
+            if replan and self._active_target is not None
+            else (
+                self.destination_x.value(),
+                self.destination_y.value(),
+                self.destination_altitude.value(),
+            )
         )
         safe_target_altitude = max(
             target[2],
@@ -583,17 +1018,43 @@ class MissionControlWindow(QMainWindow):
             float(self._telemetry["x"]),
             float(self._telemetry["y"]),
         )
-        path = self.planner.plan(
-            start,
-            (target[0], target[1]),
-            safe_target_altitude,
-            (
-                float(altitude_override)
-                if altitude_override is not None
-                else float(self._telemetry["altitude"])
-            ),
-            max_altitude_m=self._avoidance_altitude_ceiling_m,
+        # Refresh the local planning subset immediately before every A* run.
+        # Radar can still display distant people/birds, but they do not seal
+        # the navigation grid until they are close enough to matter.
+        planning_points = self._planning_obstacle_points()
+        current_altitude = (
+            float(altitude_override)
+            if altitude_override is not None
+            else float(self._telemetry["altitude"])
         )
+        self.planner.set_obstacle_points(planning_points)
+        sensor_map_relaxed = False
+        try:
+            path = self.planner.plan(
+                start,
+                (target[0], target[1]),
+                safe_target_altitude,
+                current_altitude,
+                max_altitude_m=self._avoidance_altitude_ceiling_m,
+            )
+        except RuntimeError:
+            # Raw point clouds are instantaneous and can occasionally form a
+            # false closed ring. Retry with only collision-confirmed surfaces;
+            # the forward LiDAR guard remains active and will insert a verified
+            # detour well before any real wall is reached.
+            # 순간 점군이 가짜 폐곡선을 만들면 충돌로 확인된 면만 사용해 한 번
+            # 재시도합니다. 실제 벽은 전방 LiDAR가 미리 확인해 우회벽을 추가합니다.
+            self.planner.set_obstacle_points(self._collision_obstacle_points)
+            path = self.planner.plan(
+                start,
+                (target[0], target[1]),
+                safe_target_altitude,
+                current_altitude,
+                max_altitude_m=self._avoidance_altitude_ceiling_m,
+            )
+            sensor_map_relaxed = True
+        finally:
+            self.planner.set_obstacle_points(planning_points)
         # Keep the terminal descent out of moveOnPathAsync. Its lookahead can
         # start descending while the drone is still above the building that it
         # is passing, causing repeated roof detections and hesitation.
@@ -627,11 +1088,13 @@ class MissionControlWindow(QMainWindow):
             )
         cruise = max(point[2] for point in flight_path)
         self.message_label.setText(
-            f"{'재탐색' if replan else '경로 생성'} 완료: "
+            f"{'재탐색' if replan else '경로 생성'} 완료"
+            f"{' · 순간 센서 폐곡선 제외' if sensor_map_relaxed else ''}: "
             f"웨이포인트 {len(path)}개, 최고 {cruise:.1f}m"
         )
 
     def _square_mission(self) -> None:
+        self._cancel_autonomous_patrol()
         points = build_square_path(
             self.destination_x.value(),
             self.destination_y.value(),
@@ -640,6 +1103,7 @@ class MissionControlWindow(QMainWindow):
         self.worker.submit("path", points, self.speed.value())
 
     def _heart_mission(self) -> None:
+        self._cancel_autonomous_patrol()
         points = build_heart_path(
             self.destination_x.value(),
             self.destination_y.value(),
@@ -667,6 +1131,9 @@ class MissionControlWindow(QMainWindow):
             self.emergency_button,
             self.apply_spawn_button,
             self.move_button,
+            self.route_move_button,
+            self.start_patrol_button,
+            self.stop_patrol_button,
             self.square_button,
             self.heart_button,
         ):
@@ -674,6 +1141,7 @@ class MissionControlWindow(QMainWindow):
 
     def _on_telemetry(self, data: dict) -> None:
         self._telemetry = data
+        self._update_autonomous_patrol()
         collision_timestamp = float(data.get("collision_timestamp", 0.0))
         if (
             bool(data.get("has_collided", False))
@@ -713,6 +1181,15 @@ class MissionControlWindow(QMainWindow):
         self.telemetry_labels["attitude"].setText(
             f'{data["roll"]:.1f}° / {data["pitch"]:.1f}° / {data["yaw"]:.1f}°'
         )
+        if self._autonomous_patrol_running:
+            remaining_seconds = max(
+                0.0,
+                self._autonomous_patrol_end_time - time.monotonic(),
+            )
+            self.telemetry_labels["patrol"].setText(
+                f"진행 중 · {remaining_seconds / 60.0:.1f}분 남음 · "
+                f"방문 {self._autonomous_patrol_visited}곳"
+            )
         self._advance_terminal_descent(data)
 
     def _safe_terminal_descent_altitude(
@@ -762,7 +1239,13 @@ class MissionControlWindow(QMainWindow):
             self._active_target = None
             self._planned_path = []
             self.minimap.set_path([])
-            self.message_label.setText("목표 B에 도착했습니다.")
+            if self._autonomous_patrol_running:
+                self._autonomous_patrol_visited += 1
+                self._continue_autonomous_patrol()
+            elif self._route_running:
+                self._start_next_route_waypoint()
+            else:
+                self.message_label.setText("목표 B에 도착했습니다.")
             return
 
         if not self._pending_descent_commanded:
@@ -813,11 +1296,17 @@ class MissionControlWindow(QMainWindow):
             self._pending_descent_altitude = None
             self._pending_descent_safe_altitude = None
             self._pending_descent_commanded = False
-            self.message_label.setText(
-                "목표 아래 장애물 때문에 안전 고도에서 호버링합니다."
-                if blocked_descent
-                else "목표 B에 도착했습니다."
-            )
+            if self._autonomous_patrol_running:
+                self._autonomous_patrol_visited += 1
+                self._continue_autonomous_patrol()
+            elif self._route_running:
+                self._start_next_route_waypoint()
+            else:
+                self.message_label.setText(
+                    "목표 아래 장애물 때문에 안전 고도에서 호버링합니다."
+                    if blocked_descent
+                    else "목표 B에 도착했습니다."
+                )
 
     def _recover_from_collision(self, data: dict) -> None:
         """Stop pushing and add the touched surface to the obstacle map.
@@ -945,7 +1434,7 @@ class MissionControlWindow(QMainWindow):
             )[-10000:]
         else:
             self._collision_obstacle_points = collision_wall
-        self.planner.set_obstacle_points(self._combined_obstacle_points())
+        self._refresh_obstacle_map()
 
         try:
             # Move beyond the planner's 2.5 m inflated safety radius before
@@ -1055,14 +1544,50 @@ class MissionControlWindow(QMainWindow):
             return np.empty((0, 3), dtype=np.float32)
         return np.vstack(clouds).astype(np.float32, copy=False)
 
+    def _points_near_vehicle(
+        self,
+        points: np.ndarray,
+        maximum_distance_m: float,
+    ) -> np.ndarray:
+        """Return obstacle points close enough to affect the current flight."""
+        if self._telemetry is None or not points.size:
+            return np.empty((0, 3), dtype=np.float32)
+        cloud = np.asarray(points, dtype=np.float32).reshape((-1, 3))
+        finite = np.all(np.isfinite(cloud), axis=1)
+        horizontal = np.hypot(
+            cloud[:, 0] - float(self._telemetry["x"]),
+            cloud[:, 1] - float(self._telemetry["y"]),
+        )
+        return cloud[finite & (horizontal <= float(maximum_distance_m))]
+
+    def _planning_obstacle_points(self) -> np.ndarray:
+        """Build a local collision map without turning remote targets into walls.
+
+        표시용 장거리 Radar/카메라 표적은 유지하되, 실제 A* 회피 지도에는
+        현재 비행에 영향을 줄 수 있는 근거리 점만 넣습니다.
+        """
+        clouds = [
+            cloud
+            for cloud in (
+                self._points_near_vehicle(self._latest_lidar_world, 140.0),
+                self._points_near_vehicle(self._radar_obstacle_points, 40.0),
+                self._points_near_vehicle(self._enemy_obstacle_points, 40.0),
+                self._collision_obstacle_points,
+            )
+            if cloud.size
+        ]
+        if not clouds:
+            return np.empty((0, 3), dtype=np.float32)
+        return np.vstack(clouds).astype(np.float32, copy=False)
+
     def _refresh_obstacle_map(self) -> None:
         """Push the currently enabled sensor clouds to planner and minimap.
 
         현재 활성화된 센서 점군을 경로계획기와 미니맵에 반영합니다.
         """
-        combined = self._combined_obstacle_points()
-        self.planner.set_obstacle_points(combined)
-        self.minimap.set_obstacles(combined)
+        displayed = self._combined_obstacle_points()
+        self.planner.set_obstacle_points(self._planning_obstacle_points())
+        self.minimap.set_obstacles(displayed)
 
     def _on_enemy_detections(self, detections: list[dict]) -> None:
         """Display enemy tracks and replan around an approaching drone.
@@ -1104,12 +1629,10 @@ class MissionControlWindow(QMainWindow):
                 )
                 self.telemetry_labels["enemy"].setText("탐지 없음")
             self._enemy_detection_count = 0
-            self.planner.set_obstacle_points(self._combined_obstacle_points())
+            self._refresh_obstacle_map()
             return
 
-        combined = self._combined_obstacle_points()
-        self.planner.set_obstacle_points(combined)
-        self.minimap.set_obstacles(combined)
+        self._refresh_obstacle_map()
 
         threats = [
             detection
@@ -1344,7 +1867,8 @@ class MissionControlWindow(QMainWindow):
         delta_x = world[:, 0] - float(pose["x"])
         delta_y = world[:, 1] - float(pose["y"])
         forward = delta_x * direction_x + delta_y * direction_y
-        lateral = np.abs(-delta_x * direction_y + delta_y * direction_x)
+        signed_lateral = -delta_x * direction_y + delta_y * direction_x
+        lateral = np.abs(signed_lateral)
         vertical = np.abs(world[:, 2] - float(pose["z"]))
 
         # Give the planner enough distance to stop and choose a new route.
@@ -1367,7 +1891,24 @@ class MissionControlWindow(QMainWindow):
         if not np.any(mask):
             return None
         candidates = np.flatnonzero(mask)
-        nearest_index = int(candidates[np.argmin(forward[candidates])])
+        candidates = candidates[np.argsort(forward[candidates])]
+        nearest_index: int | None = None
+        # Reject isolated rays. A real wall/large obstacle produces a compact
+        # group of returns; one or two points are commonly vegetation edges,
+        # particles, or residual self-reflections.
+        # 실제 벽은 가까운 반사점 묶음을 만들지만 1~2개 점은 식생 가장자리,
+        # 파티클 또는 기체 잔여 반사일 가능성이 높으므로 장애물로 확정하지 않습니다.
+        for candidate in candidates[:96]:
+            neighborhood = mask & (
+                (np.abs(forward - forward[candidate]) <= 1.75)
+                & (np.abs(signed_lateral - signed_lateral[candidate]) <= 1.5)
+                & (np.abs(world[:, 2] - world[candidate, 2]) <= 1.5)
+            )
+            if int(np.count_nonzero(neighborhood)) >= 4:
+                nearest_index = int(candidate)
+                break
+        if nearest_index is None:
+            return None
         nearest_distance = float(forward[nearest_index])
         # Estimate the visible facade width from returns near the first hit,
         # then add clearance for sparse scans and the vehicle body.
@@ -1379,7 +1920,7 @@ class MissionControlWindow(QMainWindow):
             if np.any(wall_band)
             else 0.0
         )
-        barrier_half_span = min(35.0, max(12.0, visible_half_span + 8.0))
+        barrier_half_span = min(25.0, max(6.0, visible_half_span + 4.0))
         hit = tuple(float(value) for value in world[nearest_index])
         return (
             nearest_distance,
@@ -1393,7 +1934,7 @@ class MissionControlWindow(QMainWindow):
         hit_xyz: tuple[float, float, float],
         travel_direction_xy: tuple[float, float],
         half_span_m: float,
-    ) -> None:
+    ) -> int:
         """Persist a detected facade across all usable flight layers.
 
         감지한 외벽을 현재 임무의 모든 사용 가능 고도층에 보존합니다.
@@ -1413,13 +1954,25 @@ class MissionControlWindow(QMainWindow):
             self._avoidance_altitude_floor_m,
             max(self._avoidance_altitude_floor_m, maximum_altitude),
         )
+        previous_count = len(self._collision_obstacle_points)
         if self._collision_obstacle_points.size:
             self._collision_obstacle_points = np.vstack(
                 (self._collision_obstacle_points, barrier)
             )[-20000:]
         else:
             self._collision_obstacle_points = barrier
-        self.planner.set_obstacle_points(self._combined_obstacle_points())
+        self._refresh_obstacle_map()
+        return previous_count
+
+    def _rollback_detected_wall(self, previous_count: int) -> None:
+        """Remove the most recent speculative LiDAR wall after a failed plan."""
+        if previous_count <= 0:
+            self._collision_obstacle_points = np.empty((0, 3), dtype=np.float32)
+        elif previous_count <= len(self._collision_obstacle_points):
+            self._collision_obstacle_points = self._collision_obstacle_points[
+                :previous_count
+            ].copy()
+        self._refresh_obstacle_map()
 
     def _on_lidar(self, snapshot: object) -> None:
         if not self.lidar_checkbox.isChecked():
@@ -1478,12 +2031,12 @@ class MissionControlWindow(QMainWindow):
             speed = 0.0 if self._telemetry is None else float(self._telemetry["speed"])
             escape_distance = max(7.0, speed * 1.25 + 3.0)
 
-            # A single sparse or noisy LiDAR return must not cancel a flight.
-            # Two consecutive frames reject isolated noise while reacting
-            # sooner than the previous three-frame requirement.
-            # 두 프레임 연속 감지로 단일 노이즈는 제거하면서 기존 세 프레임보다
-            # 더 빠르게 벽에 반응합니다.
-            if self._obstacle_detection_count < 2:
+            # Require a short three-frame confirmation in addition to the
+            # four-point spatial cluster above. At normal sensor rates this is
+            # still early enough for the 15-40 m preview corridor.
+            # 위의 4점 공간 군집에 더해 3프레임 연속 확인합니다. 일반 센서
+            # 주기에서는 15~40m 사전 탐지 범위 안에서 충분히 빠르게 반응합니다.
+            if self._obstacle_detection_count < 3:
                 return
 
             if not self.auto_replan_checkbox.isChecked():
@@ -1500,8 +2053,9 @@ class MissionControlWindow(QMainWindow):
             if now - self._last_replan > 0.75:
                 self._last_replan = now
                 self._obstacle_detection_count = 0
+                previous_wall_count = len(self._collision_obstacle_points)
                 try:
-                    self._remember_detected_wall(
+                    previous_wall_count = self._remember_detected_wall(
                         hit_xyz,
                         travel_direction,
                         barrier_half_span,
@@ -1560,8 +2114,39 @@ class MissionControlWindow(QMainWindow):
                         f"전방 {obstacle_distance:.1f}m 벽 사전 감지 · {avoidance_mode}"
                     )
                 except Exception as exc:
-                    self.worker.submit("emergency", priority=0)
-                    self._on_error(f"회피 경로 생성 실패 · 호버링: {exc}")
+                    # A speculative wall must never remain in the map when it
+                    # made A* impossible. Roll it back, retry with a narrower
+                    # local wall, and keep the old flight command for a distant
+                    # false positive instead of stopping in empty space.
+                    # 새로 만든 추정 벽 때문에 A*가 실패하면 해당 벽을 되돌리고
+                    # 더 좁은 국소 벽으로 재시도합니다. 먼 거리 오탐이면 기존
+                    # 비행 명령을 유지하여 빈 공간에서 멈추지 않습니다.
+                    self._rollback_detected_wall(previous_wall_count)
+                    narrow_wall_count = len(self._collision_obstacle_points)
+                    try:
+                        narrow_wall_count = self._remember_detected_wall(
+                            hit_xyz,
+                            travel_direction,
+                            max(4.0, barrier_half_span * 0.55),
+                        )
+                        self._plan_and_fly(replan=True)
+                        self._avoidance_grace_until = time.monotonic() + 2.0
+                        self.message_label.setText(
+                            f"전방 {obstacle_distance:.1f}m 장애물 · 좁은 측면 우회로 계속 진행"
+                        )
+                    except Exception as narrow_exc:
+                        self._rollback_detected_wall(narrow_wall_count)
+                        if obstacle_distance <= escape_distance:
+                            self.worker.submit("emergency", priority=0)
+                            self.message_label.setText(
+                                f"전방 {obstacle_distance:.1f}m 근접 장애물 · "
+                                f"안전 경로 재확인 중 ({narrow_exc})"
+                            )
+                        else:
+                            self._avoidance_grace_until = time.monotonic() + 1.5
+                            self.message_label.setText(
+                                f"전방 {obstacle_distance:.1f}m 희소 반사 제외 · 기존 경로 계속 진행"
+                            )
                 return
         else:
             self._obstacle_detection_count = 0
@@ -1572,9 +2157,10 @@ class MissionControlWindow(QMainWindow):
             "spawn": "선택한 스폰 A 위치를 적용했습니다.",
             "takeoff": "이륙 명령 전송",
             "hover": "호버링 명령 전송",
+            "mission_stop": "미션 중지 · 현재 위치 호버링",
             "move": "목적지 이동 시작",
             "path": "패턴 미션 시작",
-            "land": "착륙 명령 전송",
+            "land": "빠른 접근 착륙 명령 전송",
             "emergency": "긴급 정지 명령 전송",
         }
         self.message_label.setText(names.get(command, command))
@@ -1590,6 +2176,19 @@ class MissionControlWindow(QMainWindow):
         self.destination_y.setValue(float(self.settings.value("destination_y", 0.0)))
         self.destination_altitude.setValue(float(self.settings.value("destination_altitude", 5.0)))
         self.speed.setValue(float(self.settings.value("speed", 3.0)))
+        self.patrol_duration_minutes.setValue(
+            float(self.settings.value("patrol_duration_minutes", 5.0))
+        )
+        try:
+            stored_route = json.loads(str(self.settings.value("route_waypoints", "[]")))
+            self._route_waypoints = [
+                (float(point[0]), float(point[1]), float(point[2]))
+                for point in stored_route
+                if isinstance(point, (list, tuple)) and len(point) == 3
+            ]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._route_waypoints = []
+        self._refresh_route_list()
 
     def _save_settings(self) -> None:
         self.settings.setValue("takeoff_altitude", self.takeoff_altitude.value())
@@ -1597,6 +2196,11 @@ class MissionControlWindow(QMainWindow):
         self.settings.setValue("destination_y", self.destination_y.value())
         self.settings.setValue("destination_altitude", self.destination_altitude.value())
         self.settings.setValue("speed", self.speed.value())
+        self.settings.setValue(
+            "patrol_duration_minutes",
+            self.patrol_duration_minutes.value(),
+        )
+        self.settings.setValue("route_waypoints", json.dumps(self._route_waypoints))
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         self._save_settings()

@@ -401,8 +401,33 @@ class AirSimController:
             ).join()
         self.move_path(points, speed_mps)
 
-    def land(self) -> None:
-        self._require_client().landAsync(vehicle_name=self.vehicle_name)
+    def land(
+        self,
+        approach_altitude_m: float | None = None,
+        descent_speed_mps: float = 1.5,
+    ) -> None:
+        """Descend quickly to a safe approach height, then use AirSim landing.
+
+        안전 접근 고도까지 빠르게 하강한 뒤 AirSim 기본 착륙으로 접지합니다.
+        """
+        client = self._require_client()
+        client.cancelLastTask(vehicle_name=self.vehicle_name)
+        if approach_altitude_m is not None:
+            state = client.getMultirotorState(vehicle_name=self.vehicle_name)
+            current_altitude = -float(state.kinematics_estimated.position.z_val)
+            approach_altitude = max(0.3, float(approach_altitude_m))
+            descent_speed = min(3.0, max(0.5, float(descent_speed_mps)))
+            descent_distance = current_altitude - approach_altitude
+            if descent_distance > 0.5:
+                timeout_seconds = max(8.0, descent_distance / descent_speed * 2.0 + 3.0)
+                client.moveToZAsync(
+                    altitude_to_ned_z(approach_altitude),
+                    velocity=descent_speed,
+                    timeout_sec=timeout_seconds,
+                    yaw_mode=airsim.YawMode(False, 0),
+                    vehicle_name=self.vehicle_name,
+                ).join()
+        client.landAsync(timeout_sec=30, vehicle_name=self.vehicle_name)
 
     def emergency_stop(self) -> None:
         client = self._require_client()

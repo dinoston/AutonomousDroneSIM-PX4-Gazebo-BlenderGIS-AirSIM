@@ -241,7 +241,24 @@ class AltitudeGridPlanner:
         goal: tuple[int, int],
         blocked: set[tuple[int, int]],
     ) -> list[tuple[int, int]]:
-        blocked = blocked - {start, goal}
+        # The vehicle already occupies its current footprint. LiDAR returns
+        # from landing gear/attachments or a nearby surface can otherwise
+        # inflate around the start cell and make an open scene look sealed.
+        # Clear only the already occupied start footprint; the goal keeps its
+        # surrounding clearance so a target inside a building is not accepted.
+        # 기체가 현재 차지한 영역은 실제로 비어 있습니다. 랜딩기어/부착물의
+        # LiDAR 반사나 가까운 표면이 시작 셀 주위를 팽창시켜 열린 공간을
+        # 완전히 막힌 것으로 만들지 않도록 현재 기체 영역만 비웁니다.
+        start_clearance = max(
+            1,
+            int(ceil(self.config.drone_radius_m / self.config.resolution_m)),
+        )
+        blocked = {
+            cell
+            for cell in blocked
+            if hypot(cell[0] - start[0], cell[1] - start[1]) > start_clearance
+        }
+        blocked.discard(goal)
         frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
         came_from: dict[tuple[int, int], tuple[int, int]] = {}
         cost = {start: 0.0}
