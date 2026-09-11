@@ -1,0 +1,15 @@
+diff --git a/Source/AirLib/include/vehicles/multirotor/firmwares/simple_flight/firmware/Params.hpp b/Source/AirLib/include/vehicles/multirotor/firmwares/simple_flight/firmware/Params.hpp
+--- a/Source/AirLib/include/vehicles/multirotor/firmwares/simple_flight/firmware/Params.hpp
++++ b/Source/AirLib/include/vehicles/multirotor/firmwares/simple_flight/firmware/Params.hpp
+@@ -133,7 +133,10 @@ struct Params
+ 
+     GoalMode default_goal_mode = GoalMode::getStandardAngleMode();
+     VehicleStateType default_vehicle_state = VehicleStateType::Inactive;
+-    uint64_t api_goal_timeout = 60; //milliseconds
++    // Sensor rendering and semantic-label updates can briefly stall Unreal's
++    // game thread. Keep the failsafe, but tolerate short frame/RPC hitches so
++    // an active moveOnPath command does not unexpectedly fall back to hover.
++    uint64_t api_goal_timeout = 2000; // milliseconds
+     ControllerType controller_type = ControllerType::Cascade;
+     bool gains_changed;
+ };

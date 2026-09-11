@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "mask_encoding": "airsim_rgb_palette_png",
+  "description": "Stable semantic classes shared by every simulated Korean city map.",
+  "classes": [
+    {
+      "id": 0,
+      "name": "background",
+      "name_ko": "배경",
+      "color_rgb": [255, 255, 255],
+      "priority": -1,
+      "patterns": []
+    },
+    {
+      "id": 219,
+      "name": "building",
+      "name_ko": "건물",
+      "color_rgb": [255, 95, 79],
+      "priority": 20,
+      "patterns": [
+        ".*[Bb]uilding.*",
+        ".*[Hh]angar.*",
+        ".*[Ww]arehouse.*",
+        ".*[Hh]ouse.*",
+        ".*[Aa]partment.*",
+        ".*[Ss]kyscraper.*",
+        ".*[Rr]oof.*",
+        ".*[Ww]all.*",
+        ".*[Ss]tructure.*"
+      ]
+    },
+    {
+      "id": 216,
+      "name": "human",
+      "name_ko": "사람",
+      "color_rgb": [255, 255, 79],
+      "priority": 80,
+      "patterns": [
+        ".*AINormalPeople.*",
+        ".*[Hh]uman.*",
+        ".*[Pp]erson.*",
+        ".*[Pp]edestrian.*",
+        ".*Ch0[12].*",
+        ".*NormalPeople.*"
+      ]
+    },
+    {
+      "id": 252,
+      "name": "drone",
+      "name_ko": "드론",
+      "color_rgb": [255, 79, 255],
+      "priority": 70,
+      "patterns": [
+        ".*EnemyDrone.*",
+        ".*Drone_Futuristic.*",
+        ".*[Dd]rone.*",
+        ".*SimpleFlight.*"
+      ]
+    },
+    {
+      "id": 48,
+      "name": "bird",
+      "name_ko": "새",
+      "color_rgb": [95, 255, 255],
+      "priority": 90,
+      "patterns": [
+        ".*[Bb]ird.*",
+        ".*[Cc]row.*",
+        ".*[Bb]oid.*",
+        ".*[Ff]lock.*",
+        ".*crowrigconjay.*"
+      ]
+    },
+    {
+      "id": 60,
+      "name": "road",
+      "name_ko": "도로",
+      "color_rgb": [95, 95, 255],
+      "priority": 30,
+      "patterns": [
+        ".*[Rr]oad.*",
+        ".*[Ss]treet.*",
+        ".*[Aa]sphalt.*",
+        ".*[Ss]idewalk.*",
+        ".*[Cc]urb.*",
+        ".*[Pp]avement.*"
+      ]
+    },
+    {
+      "id": 234,
+      "name": "vegetation",
+      "name_ko": "식생",
+      "color_rgb": [95, 255, 79],
+      "priority": 40,
+      "patterns": [
+        ".*[Tt]ree.*",
+        ".*[Bb]ush.*",
+        ".*[Gg]rass.*",
+        ".*[Ff]oliage.*",
+        ".*[Pp]lant.*",
+        ".*[Ss]hrub.*"
+      ]
+    },
+    {
+      "id": 217,
+      "name": "vehicle",
+      "name_ko": "차량",
+      "color_rgb": [255, 127, 79],
+      "priority": 60,
+      "patterns": [
+        ".*[Cc]ar.*",
+        ".*[Tt]ruck.*",
+        ".*[Bb]us.*",
+        ".*[Vv]ehicle.*",
+        ".*[Vv]an.*"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "other_obstacle",
+      "name_ko": "기타 장애물",
+      "color_rgb": [127, 127, 127],
+      "priority": 0,
+      "patterns": [
+        ".*"
+      ]
+    }
+  ]
+}

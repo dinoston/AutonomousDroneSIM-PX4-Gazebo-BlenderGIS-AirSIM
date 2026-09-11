@@ -7,6 +7,7 @@ import json
 import math
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -15,22 +16,26 @@ if str(PYTHON_CLIENT_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_CLIENT_ROOT))
 
 import numpy as np
-from PySide6.QtCore import QSettings, QThread, Signal
+from PySide6.QtCore import QSettings, QThread, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -38,8 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from common.airsim_client import AirSimController
-from missions.heart_mission import build_heart_path
-from missions.square_mission import build_square_path
+from data_collection.recorder import DataRecorder, RecordingConfig
 from navigation.grid_planner import (
     AltitudeGridPlanner,
     PlannerConfig,
@@ -55,6 +59,9 @@ from ui.minimap import MiniMapWidget
 
 class AirSimWorker(QThread):
     connection_changed = Signal(bool, str)
+    status_changed = Signal(str)
+    semantic_setup_completed = Signal(str)
+    semantic_setup_failed = Signal(str)
     telemetry_updated = Signal(dict)
     images_updated = Signal(dict)
     lidar_updated = Signal(object)
@@ -72,16 +79,63 @@ class AirSimWorker(QThread):
         self._lidar_enabled = True
         self._radar_enabled = True
         self._sensor_ray_debug_enabled = False
+        self._camera_interval_s = 0.5
         self._last_sensor_error = 0.0
+        self._suspend_polling = False
+        self._semantic_setup_running = False
 
     def submit(self, name: str, *args, priority: int = 10) -> None:
         self._commands.put((priority, next(self._sequence), name, args))
+
+    def request_connect(self) -> None:
+        self.submit("connect", priority=-10)
+
+    def request_disconnect(self) -> None:
+        # Prevent another sensor RPC from starting after the user requests a
+        # disconnect. The current RPC finishes, then the priority command runs.
+        # 연결 해제 요청 뒤에는 새 센서 RPC를 시작하지 않고, 현재 호출이
+        # 끝나는 즉시 우선순위가 높은 해제 명령을 처리합니다.
+        self._suspend_polling = True
+        self.submit("disconnect", priority=-10)
+
+    def _start_semantic_setup(self) -> None:
+        """Apply the level class map without blocking flight commands."""
+        if self._semantic_setup_running:
+            self.status_changed.emit("Segmentation 클래스 적용이 이미 진행 중입니다.")
+            return
+        self._semantic_setup_running = True
+        host = self.controller.host
+        port = self.controller.port
+
+        def configure() -> None:
+            try:
+                report = AirSimController.build_segmentation_report(host, port)
+                if self.controller.connected:
+                    self.controller.apply_segmentation_report(report)
+                    self.semantic_setup_completed.emit(
+                        self.controller.segmentation_status
+                    )
+            except Exception as exc:
+                if self.controller.connected:
+                    self.controller.apply_segmentation_error(str(exc))
+                    self.semantic_setup_failed.emit(str(exc))
+            finally:
+                self._semantic_setup_running = False
+
+        threading.Thread(
+            target=configure,
+            name="AirSimSemanticSetup",
+            daemon=True,
+        ).start()
 
     def stop(self) -> None:
         self._running = False
 
     def set_sensor_streaming(self, enabled: bool) -> None:
         self._stream_sensors = enabled
+
+    def set_camera_rate_hz(self, rate_hz: float) -> None:
+        self._camera_interval_s = 1.0 / min(10.0, max(0.5, float(rate_hz)))
 
     def set_lidar_enabled(self, enabled: bool) -> None:
         self._lidar_enabled = bool(enabled)
@@ -131,26 +185,45 @@ class AirSimWorker(QThread):
         while self._running:
             self._process_pending_commands()
             now = time.monotonic()
-            if self.controller.connected and now >= next_telemetry:
+            if (
+                self.controller.connected
+                and not self._suspend_polling
+                and now >= next_telemetry
+            ):
                 self._poll_telemetry()
                 next_telemetry = now + 0.1
             # LiDAR is a flight-safety input and must keep running even when
             # the optional camera preview stream is disabled.
             # LiDAR는 비행 안전에 필요한 입력이므로 선택형 카메라 미리보기
             # 스트리밍이 꺼져 있어도 계속 작동해야 합니다.
-            if self.controller.connected and self._lidar_enabled and now >= next_lidar:
+            if (
+                self.controller.connected
+                and not self._suspend_polling
+                and self._lidar_enabled
+                and now >= next_lidar
+            ):
                 self._poll_lidar()
                 next_lidar = now + 0.15
             # Radar is polled independently so either ranging sensor can be
             # enabled without forcing the other sensor to run.
             # 두 거리 센서를 독립적으로 켜고 끌 수 있도록 Radar는 별도
             # 주기로 수신합니다.
-            if self.controller.connected and self._radar_enabled and now >= next_radar:
+            if (
+                self.controller.connected
+                and not self._suspend_polling
+                and self._radar_enabled
+                and now >= next_radar
+            ):
                 self._poll_radar()
                 next_radar = now + 0.1
-            if self.controller.connected and self._stream_sensors and now >= next_images:
+            if (
+                self.controller.connected
+                and not self._suspend_polling
+                and self._stream_sensors
+                and now >= next_images
+            ):
                 self._poll_images()
-                next_images = now + 0.5
+                next_images = now + self._camera_interval_s
             self.msleep(20)
         self.controller.disconnect()
 
@@ -162,7 +235,9 @@ class AirSimWorker(QThread):
                 return
             try:
                 if name == "connect":
+                    self._suspend_polling = True
                     self.controller.connect()
+                    self.status_changed.emit("AirSim RPC 연결됨 · 센서 설정 중…")
                     # Reapply both default-on UI states after each connection.
                     # 연결할 때마다 기본 ON인 두 UI 상태를 언리얼 표시에 동기화합니다.
                     self.controller.set_sensor_debug_visualization(
@@ -174,9 +249,15 @@ class AirSimWorker(QThread):
                     self.controller.set_sensor_debug_visualization(
                         "sensor_ray", self._sensor_ray_debug_enabled
                     )
-                    self.connection_changed.emit(True, "연결됨")
+                    self._suspend_polling = False
+                    self.connection_changed.emit(
+                        True,
+                        "연결됨 · 인식 클래스 준비 중…",
+                    )
+                    self._start_semantic_setup()
                 elif name == "disconnect":
                     self.controller.disconnect()
+                    self._suspend_polling = False
                     self.connection_changed.emit(False, "연결 해제")
                 elif name == "arm":
                     self.controller.arm(bool(args[0]))
@@ -202,13 +283,22 @@ class AirSimWorker(QThread):
                     self.controller.set_sensor_debug_visualization(
                         str(args[0]), bool(args[1])
                     )
+                elif name == "segmentation":
+                    self._start_semantic_setup()
                 else:
                     raise ValueError(f"알 수 없는 명령: {name}")
-                if name not in {"connect", "disconnect"}:
+                if name not in {"connect", "disconnect", "segmentation"}:
                     self.command_completed.emit(name)
             except Exception as exc:
+                if name in {"connect", "disconnect"}:
+                    self._suspend_polling = False
                 if name == "connect":
                     self.connection_changed.emit(False, "연결 실패")
+                elif name == "disconnect":
+                    self.connection_changed.emit(
+                        self.controller.connected,
+                        "연결 해제 실패",
+                    )
                 self.error_occurred.emit(f"{name}: {exc}")
 
     def _poll_telemetry(self) -> None:
@@ -250,10 +340,16 @@ class AirSimWorker(QThread):
 class MissionControlWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Autonomous Drone Mission Control · Avoidance v9")
+        self.setWindowTitle(
+            "Autonomous Drone Mission Control · Semantic/Data v1 · Avoidance v9"
+        )
         self.resize(1500, 920)
         self.settings = QSettings("AutonomousDrone", "MissionControl")
+        self.recorder = DataRecorder()
         self._connected = False
+        self._connection_transition: str | None = None
+        self._semantic_ready = False
+        self._takeoff_pending = False
         # The AirBase capture covers 1400 m. A 2.5 m planning grid keeps
         # full-map A* practical while retaining useful obstacle clearance.
         # AirBase 캡처 범위는 1400m이며, 2.5m 격자를 사용해 전체 지도 A*의
@@ -291,6 +387,8 @@ class MissionControlWindow(QMainWindow):
         self._pending_descent_commanded = False
         self._last_replan = 0.0
         self._last_emergency_stop = 0.0
+        self._mission_stall_started = 0.0
+        self._last_stall_recovery = 0.0
         self._obstacle_detection_count = 0
         self._avoidance_grace_until = 0.0
         self._last_collision_timestamp = 0.0
@@ -306,9 +404,15 @@ class MissionControlWindow(QMainWindow):
         self._last_enemy_replan = 0.0
         self._enemy_detection_count = 0
         self._detection_error_reported = False
+        self._last_collection_error = ""
 
         self.worker = AirSimWorker()
         self.worker.connection_changed.connect(self._on_connection_changed)
+        self.worker.status_changed.connect(self._on_worker_status)
+        self.worker.semantic_setup_completed.connect(
+            self._on_semantic_setup_completed
+        )
+        self.worker.semantic_setup_failed.connect(self._on_semantic_setup_failed)
         self.worker.telemetry_updated.connect(self._on_telemetry)
         self.worker.images_updated.connect(self._on_images)
         self.worker.lidar_updated.connect(self._on_lidar)
@@ -372,7 +476,6 @@ class MissionControlWindow(QMainWindow):
 
     def _build_control_panel(self) -> QWidget:
         panel = QFrame()
-        panel.setMaximumWidth(430)
         layout = QVBoxLayout(panel)
 
         flight_group = QGroupBox("비행 제어")
@@ -380,6 +483,9 @@ class MissionControlWindow(QMainWindow):
         self.arm_button = QPushButton("ARM")
         self.disarm_button = QPushButton("DISARM")
         self.takeoff_button = QPushButton("이륙")
+        self.takeoff_button.setToolTip(
+            "기존 이동 명령을 취소하고 API 제어·ARM을 확인한 뒤 설정 고도까지 이륙합니다."
+        )
         self.hover_button = QPushButton("미션 중지·호버링")
         self.cancel_route_button = QPushButton("예약 목록 취소")
         self.land_button = QPushButton("착륙")
@@ -464,16 +570,6 @@ class MissionControlWindow(QMainWindow):
         destination_form.addRow(patrol_row)
         layout.addWidget(destination_group)
 
-        mission_group = QGroupBox("패턴 미션")
-        mission_layout = QHBoxLayout(mission_group)
-        self.square_button = QPushButton("사각형 비행")
-        self.heart_button = QPushButton("하트 비행")
-        self.square_button.clicked.connect(self._square_mission)
-        self.heart_button.clicked.connect(self._heart_mission)
-        mission_layout.addWidget(self.square_button)
-        mission_layout.addWidget(self.heart_button)
-        layout.addWidget(mission_group)
-
         telemetry_group = QGroupBox("실시간 텔레메트리")
         telemetry_layout = QFormLayout(telemetry_group)
         self.telemetry_labels: dict[str, QLabel] = {}
@@ -496,7 +592,16 @@ class MissionControlWindow(QMainWindow):
             telemetry_layout.addRow(label, value)
         layout.addWidget(telemetry_group)
         layout.addStretch()
-        return panel
+
+        scroll = QScrollArea()
+        scroll.setObjectName("controlScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(350)
+        scroll.setMaximumWidth(450)
+        scroll.setWidget(panel)
+        return scroll
 
     def _build_sensor_panel(self) -> QWidget:
         tabs = QTabWidget()
@@ -518,10 +623,145 @@ class MissionControlWindow(QMainWindow):
         self.minimap.spawn_selected.connect(self._on_spawn_selected)
         self.minimap.target_selected.connect(self._on_target_selected)
         tabs.addTab(self.minimap, "미니맵 · A* 경로")
+        # Keep collection next to the minimap so it remains visible even when
+        # the sensor pane is narrow.
+        # 센서 패널이 좁아도 수집 탭이 가려지지 않도록 두 번째에 둡니다.
+        tabs.addTab(self._build_data_collection_panel(), "데이터 수집")
         tabs.addTab(self.camera_viewer, "RGB · Depth · Segmentation")
         tabs.addTab(self.lidar_viewer, "LiDAR 3D 점군")
         tabs.addTab(self.radar_viewer, "Radar 3D 점군")
         return tabs
+
+    def _build_data_collection_panel(self) -> QWidget:
+        panel = QWidget()
+        root = QVBoxLayout(panel)
+
+        guide_group = QGroupBox("처음 사용하는 방법")
+        guide_layout = QVBoxLayout(guide_group)
+        guide = QLabel(
+            "1. 도시·구역·지형을 기록  →  "
+            "2. 저장할 센서를 선택  →  "
+            "3. <b>● 수집 시작</b>  →  "
+            "4. 드론 미션 실행  →  "
+            "5. <b>■ 수집 종료</b><br>"
+            "RGB 프레임을 기준으로 Depth·Segmentation·LiDAR·Radar·"
+            "비행 상태와 바운딩 박스를 함께 저장합니다. "
+            "처음에는 기본값 2 Hz를 권장합니다."
+        )
+        guide.setWordWrap(True)
+        guide.setStyleSheet(
+            "background:#101722; border:1px solid #31547a; "
+            "border-radius:5px; padding:10px; color:#d8edff;"
+        )
+        guide_layout.addWidget(guide)
+        root.addWidget(guide_group)
+
+        session_group = QGroupBox("데이터셋 세션")
+        session_form = QFormLayout(session_group)
+        self.dataset_name_edit = QLineEdit("KoreaDroneDataset")
+        self.dataset_name_edit.setToolTip("실험 전체를 묶는 최상위 폴더 이름입니다.")
+        self.city_edit = QLineEdit("AirBase")
+        self.city_edit.setToolTip("현재 사용하는 도시 또는 Unreal 맵 이름입니다.")
+        self.region_edit = QLineEdit("default")
+        self.region_edit.setToolTip("같은 도시 안의 촬영 구역·시나리오 이름입니다.")
+        self.terrain_combo = QComboBox()
+        self.terrain_combo.setEditable(True)
+        self.terrain_combo.addItems(
+            [
+                "산업단지",
+                "고층 도심",
+                "저층 주택가",
+                "공원·광장",
+                "산지",
+                "해안",
+                "교량·하천",
+            ]
+        )
+        self.collection_root_edit = QLineEdit(
+            str(Path.home() / "Documents" / "AutonomousDroneDatasets")
+        )
+        self.collection_root_edit.setToolTip("실제 PNG·NPZ·JSON 데이터가 저장될 상위 폴더입니다.")
+        self.collection_browse_button = QPushButton("저장 폴더 선택")
+        self.collection_browse_button.clicked.connect(self._browse_collection_root)
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.collection_root_edit)
+        output_row.addWidget(self.collection_browse_button)
+        session_form.addRow("실험/데이터셋 이름", self.dataset_name_edit)
+        session_form.addRow("도시 또는 맵", self.city_edit)
+        session_form.addRow("구역/시나리오", self.region_edit)
+        session_form.addRow("비교용 지형 분류", self.terrain_combo)
+        session_form.addRow("저장 위치", output_row)
+        session_help = QLabel(
+            "※ 위 네 항목은 사용자가 실험 조건에 맞게 입력합니다. "
+            "한 번 입력한 값은 다음 실행에도 유지됩니다."
+        )
+        session_help.setWordWrap(True)
+        session_help.setStyleSheet("color:#8fb9dc; padding-top:4px;")
+        session_form.addRow(session_help)
+        root.addWidget(session_group)
+
+        sensor_group = QGroupBox("동기화 수집 항목")
+        sensor_layout = QGridLayout(sensor_group)
+        sensor_labels = [
+            ("rgb", "RGB"),
+            ("depth", "Depth"),
+            ("segmentation", "Segmentation"),
+            ("lidar", "LiDAR"),
+            ("radar", "Radar"),
+            ("telemetry", "비행 상태"),
+            ("annotations", "객체 정답·박스"),
+        ]
+        self.collection_sensor_checks: dict[str, QCheckBox] = {}
+        for index, (key, label) in enumerate(sensor_labels):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            self.collection_sensor_checks[key] = checkbox
+            sensor_layout.addWidget(checkbox, index // 3, index % 3)
+        self.collection_rate = self._spinbox(0.5, 10.0, 2.0, " Hz")
+        self.collection_rate.setSingleStep(0.5)
+        sensor_layout.addWidget(QLabel("저장 주기"), 3, 0)
+        sensor_layout.addWidget(self.collection_rate, 3, 1)
+        root.addWidget(sensor_group)
+
+        control_group = QGroupBox("수집 제어")
+        control_layout = QGridLayout(control_group)
+        self.collection_start_button = QPushButton("● 수집 시작")
+        self.collection_pause_button = QPushButton("일시정지")
+        self.collection_stop_button = QPushButton("■ 수집 종료")
+        self.segmentation_apply_button = QPushButton("Segmentation 다시 적용")
+        self.segmentation_apply_button.setToolTip(
+            "연결 후 새 객체를 추가한 경우에만 누르세요. "
+            "평상시에는 재연결 시 자동 적용됩니다."
+        )
+        self.collection_start_button.clicked.connect(self._start_collection)
+        self.collection_pause_button.clicked.connect(self._toggle_collection_pause)
+        self.collection_stop_button.clicked.connect(self._stop_collection)
+        self.segmentation_apply_button.clicked.connect(self._reapply_segmentation)
+        control_layout.addWidget(self.collection_start_button, 0, 0)
+        control_layout.addWidget(self.collection_pause_button, 0, 1)
+        control_layout.addWidget(self.collection_stop_button, 0, 2)
+        control_layout.addWidget(self.segmentation_apply_button, 1, 0, 1, 3)
+        root.addWidget(control_group)
+
+        status_group = QGroupBox("수집 상태")
+        status_form = QFormLayout(status_group)
+        self.collection_status_labels: dict[str, QLabel] = {}
+        for label, key in (
+            ("상태", "state"),
+            ("수집 시간", "elapsed"),
+            ("저장 프레임", "frames"),
+            ("대기/누락", "queue"),
+            ("저장 용량", "bytes"),
+            ("세션 폴더", "path"),
+        ):
+            value = QLabel("—")
+            value.setWordWrap(True)
+            self.collection_status_labels[key] = value
+            status_form.addRow(label, value)
+        root.addWidget(status_group)
+        root.addStretch()
+        self._refresh_collection_status()
+        return panel
 
     @staticmethod
     def _spinbox(minimum: float, maximum: float, value: float, suffix: str) -> QDoubleSpinBox:
@@ -533,12 +773,209 @@ class MissionControlWindow(QMainWindow):
         widget.setSuffix(suffix)
         return widget
 
+    def _browse_collection_root(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "데이터셋 저장 폴더 선택",
+            self.collection_root_edit.text(),
+        )
+        if selected:
+            self.collection_root_edit.setText(selected)
+
+    def _selected_collection_sensors(self) -> tuple[str, ...]:
+        return tuple(
+            key
+            for key, checkbox in self.collection_sensor_checks.items()
+            if checkbox.isChecked()
+        )
+
+    def _start_collection(self) -> None:
+        if not self._connected:
+            self._on_error("데이터 수집: AirSim에 먼저 연결하세요.")
+            return
+        if not self._semantic_ready:
+            self._on_error(
+                "데이터 수집: Segmentation 클래스 준비가 끝난 뒤 시작하세요."
+            )
+            return
+        try:
+            sensors = self._selected_collection_sensors()
+            config = RecordingConfig(
+                output_root=Path(self.collection_root_edit.text()),
+                dataset_name=self.dataset_name_edit.text(),
+                city=self.city_edit.text(),
+                region=self.region_edit.text(),
+                terrain_type=self.terrain_combo.currentText(),
+                sensors=sensors,
+                sample_rate_hz=float(self.collection_rate.value()),
+            )
+            # Camera frames are the synchronization boundary. Requested range
+            # sensors are also enabled so their nearest samples are available.
+            self.sensor_checkbox.setChecked(True)
+            if "lidar" in sensors:
+                self.lidar_checkbox.setChecked(True)
+            if "radar" in sensors:
+                self.radar_checkbox.setChecked(True)
+            self.worker.set_camera_rate_hz(config.sample_rate_hz)
+            session_dir = self.recorder.start(config)
+            self.message_label.setText(f"데이터 수집 시작: {session_dir}")
+        except Exception as exc:
+            self._on_error(f"데이터 수집 시작 실패: {exc}")
+        self._refresh_collection_status()
+
+    def _toggle_collection_pause(self) -> None:
+        try:
+            if self.recorder.state == "recording":
+                self.recorder.pause()
+                self.message_label.setText("데이터 수집을 일시정지했습니다.")
+            elif self.recorder.state == "paused":
+                self.recorder.resume()
+                self.message_label.setText("데이터 수집을 다시 시작했습니다.")
+            else:
+                raise RuntimeError("진행 중인 데이터 수집이 없습니다.")
+        except Exception as exc:
+            self._on_error(f"데이터 수집: {exc}")
+        self._refresh_collection_status()
+
+    def _stop_collection(self) -> None:
+        self.recorder.stop()
+        stats = self.recorder.stats()
+        self.message_label.setText(
+            f"데이터 수집 종료 · {stats['written_frames']}프레임 · "
+            f"{self._format_bytes(int(stats['bytes_written']))}"
+        )
+        self._refresh_collection_status()
+
+    def _reapply_segmentation(self) -> None:
+        if not self._connected:
+            self._on_error("Segmentation: AirSim에 먼저 연결하세요.")
+            return
+        self._semantic_ready = False
+        self._refresh_collection_status()
+        self.worker.submit("segmentation", priority=1)
+        self.message_label.setText(
+            "현재 레벨의 Segmentation 클래스를 백그라운드에서 재적용 중…"
+        )
+
+    def _collection_mission_metadata(self) -> dict[str, object]:
+        mission_type = (
+            "central_patrol"
+            if self._autonomous_patrol_running
+            else "reserved_route"
+            if self._route_running
+            else "manual_or_hover"
+        )
+        return {
+            "type": mission_type,
+            "active_target": self._active_target,
+            "route_index": self._active_route_index,
+            "reserved_waypoints": self._route_waypoints,
+            "planned_path": self._planned_path,
+            "patrol_cycle": self._patrol_cycle_number,
+            "patrol_visited": self._autonomous_patrol_visited,
+        }
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        size = float(max(0, value))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    def _refresh_collection_status(self) -> None:
+        if not hasattr(self, "collection_status_labels"):
+            return
+        stats = self.recorder.stats()
+        state_names = {
+            "idle": "대기",
+            "recording": "● 수집 중",
+            "paused": "일시정지",
+            "stopping": "저장 마무리 중",
+            "stopped": "완료",
+            "error": "오류",
+        }
+        self.collection_status_labels["state"].setText(
+            state_names.get(str(stats["state"]), str(stats["state"]))
+        )
+        elapsed = int(float(stats["elapsed_seconds"]))
+        self.collection_status_labels["elapsed"].setText(
+            f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        )
+        self.collection_status_labels["frames"].setText(
+            f"{stats['written_frames']}"
+        )
+        self.collection_status_labels["queue"].setText(
+            f"{stats['queued_frames']} / 누락 {stats['dropped_frames']}"
+        )
+        self.collection_status_labels["bytes"].setText(
+            self._format_bytes(int(stats["bytes_written"]))
+        )
+        self.collection_status_labels["path"].setText(
+            str(stats["session_dir"] or "—")
+        )
+        state = str(stats["state"])
+        self.collection_start_button.setEnabled(
+            self._connected
+            and self._semantic_ready
+            and state not in {"recording", "paused", "stopping"}
+        )
+        self.collection_pause_button.setEnabled(state in {"recording", "paused"})
+        self.collection_pause_button.setText(
+            "수집 재개" if state == "paused" else "일시정지"
+        )
+        self.collection_stop_button.setEnabled(state in {"recording", "paused"})
+        error = str(stats.get("last_error", ""))
+        if error and error != self._last_collection_error:
+            self._last_collection_error = error
+            self.message_label.setText(f"데이터 저장 오류: {error}")
+
     def _toggle_connection(self) -> None:
+        if self._connection_transition is not None:
+            return
         if self._connected:
-            self.worker.submit("disconnect", priority=1)
+            self._connection_transition = "disconnect"
+            self.connect_button.setEnabled(False)
+            self.connect_button.setText("연결 해제 중…")
+            self._set_controls_enabled(False)
+            self.message_label.setText(
+                "AirSim 연결 해제 중… 현재 센서 호출이 끝나면 자동으로 해제됩니다."
+            )
+            self.worker.request_disconnect()
         else:
+            self._connection_transition = "connect"
+            self.connect_button.setEnabled(False)
+            self.connect_button.setText("연결 중…")
             self.message_label.setText("AirSim 연결 중…")
-            self.worker.submit("connect", priority=1)
+            self.worker.request_connect()
+
+    def _on_worker_status(self, message: str) -> None:
+        self.message_label.setText(message)
+
+    def _on_semantic_setup_completed(self, status: str) -> None:
+        if not self._connected:
+            return
+        self._semantic_ready = True
+        message = f"연결됨 · {status}"
+        self.status_indicator.setText(f"● {message}")
+        self.message_label.setText(message)
+        self._set_controls_enabled(True)
+        self._refresh_collection_status()
+
+    def _on_semantic_setup_failed(self, error: str) -> None:
+        if not self._connected:
+            return
+        self._semantic_ready = False
+        self.status_indicator.setText("● 연결됨 · Segmentation 규칙 미적용")
+        self.message_label.setText(
+            f"비행 연결은 정상입니다. Segmentation 적용 실패: {error}"
+        )
+        # Semantic labels may fail independently of the flight RPC. Keep the
+        # aircraft controls available, while data collection remains blocked.
+        # Semantic 라벨 적용이 실패해도 비행 RPC는 사용할 수 있습니다.
+        self._set_controls_enabled(True)
+        self._refresh_collection_status()
 
     def _on_lidar_toggled(self, enabled: bool) -> None:
         """Clear LiDAR-only state when its default-on toggle is disabled.
@@ -573,7 +1010,14 @@ class MissionControlWindow(QMainWindow):
         self.message_label.setText("Radar 수신과 센서 융합을 껐습니다.")
 
     def _takeoff(self) -> None:
-        self.worker.submit("takeoff", self.takeoff_altitude.value())
+        if self._takeoff_pending:
+            return
+        self._clear_active_mission_state()
+        self.worker.discard_pending_navigation()
+        self._takeoff_pending = True
+        self.takeoff_button.setEnabled(False)
+        self.message_label.setText("이륙 준비 · API 제어와 ARM 상태 확인 중…")
+        self.worker.submit("takeoff", self.takeoff_altitude.value(), priority=2)
 
     def _clear_active_mission_state(self) -> None:
         """Cancel route state without deleting the user's reserved points."""
@@ -590,6 +1034,7 @@ class MissionControlWindow(QMainWindow):
         self._pending_descent_commanded = False
         self._obstacle_detection_count = 0
         self._enemy_detection_count = 0
+        self._mission_stall_started = 0.0
         self.minimap.set_path([])
         if patrol_was_running:
             self.telemetry_labels["patrol"].setText(
@@ -1066,6 +1511,7 @@ class MissionControlWindow(QMainWindow):
         self._pending_descent_commanded = False
         self._planned_path = flight_path
         self._active_target = target
+        self._mission_stall_started = 0.0
         self.minimap.set_target(target[0], target[1])
         self.minimap.set_path(flight_path)
         # A replacement path already supersedes the previous AirSim command.
@@ -1093,33 +1539,27 @@ class MissionControlWindow(QMainWindow):
             f"웨이포인트 {len(path)}개, 최고 {cruise:.1f}m"
         )
 
-    def _square_mission(self) -> None:
-        self._cancel_autonomous_patrol()
-        points = build_square_path(
-            self.destination_x.value(),
-            self.destination_y.value(),
-            self.destination_altitude.value(),
-        )
-        self.worker.submit("path", points, self.speed.value())
-
-    def _heart_mission(self) -> None:
-        self._cancel_autonomous_patrol()
-        points = build_heart_path(
-            self.destination_x.value(),
-            self.destination_y.value(),
-            self.destination_altitude.value(),
-        )
-        self.worker.submit("path", points, self.speed.value())
-
     def _on_connection_changed(self, connected: bool, message: str) -> None:
         self._connected = connected
+        self._semantic_ready = False
+        self._connection_transition = None
+        self.connect_button.setEnabled(True)
+        if not connected:
+            self._takeoff_pending = False
+        if not connected and self.recorder.state in {"recording", "paused"}:
+            self.recorder.stop()
         self.status_indicator.setText(f"● {message}")
         self.status_indicator.setObjectName("connected" if connected else "disconnected")
         self.status_indicator.style().unpolish(self.status_indicator)
         self.status_indicator.style().polish(self.status_indicator)
         self.connect_button.setText("연결 해제" if connected else "AirSim 연결")
-        self._set_controls_enabled(connected)
+        # Applying thousands of segmentation labels can briefly stall the
+        # Unreal/AirSim RPC server. Starting flight during that window can trip
+        # SimpleFlight's API watchdog and leave the drone hovering.
+        # Segmentation 초기화가 끝나기 전에 비행을 시작하지 않도록 합니다.
+        self._set_controls_enabled(connected and self._semantic_ready)
         self.message_label.setText(message)
+        self._refresh_collection_status()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -1134,13 +1574,15 @@ class MissionControlWindow(QMainWindow):
             self.route_move_button,
             self.start_patrol_button,
             self.stop_patrol_button,
-            self.square_button,
-            self.heart_button,
+            self.segmentation_apply_button,
         ):
             widget.setEnabled(enabled)
+        self._refresh_collection_status()
 
     def _on_telemetry(self, data: dict) -> None:
         self._telemetry = data
+        self.recorder.update_telemetry(data)
+        self._refresh_collection_status()
         self._update_autonomous_patrol()
         collision_timestamp = float(data.get("collision_timestamp", 0.0))
         if (
@@ -1191,6 +1633,58 @@ class MissionControlWindow(QMainWindow):
                 f"방문 {self._autonomous_patrol_visited}곳"
             )
         self._advance_terminal_descent(data)
+        self._recover_stalled_mission(data)
+
+    def _recover_stalled_mission(self, data: dict) -> None:
+        """Replan when an active mission silently falls back to hover.
+
+        SimpleFlight enters hover when its API goal watchdog expires. In a
+        sensor-heavy scene that can happen without a real obstacle, leaving the
+        UI route active but the vehicle stationary. After a short confirmation
+        window, calculate a fresh safe path instead of blindly resending the
+        stale command.
+
+        API 워치독으로 임무가 중간에 호버링으로 바뀌었을 때, 일시적
+        감속과 구분하여 안전 경로를 자동 재계산합니다.
+        """
+        if not self._connected or self._active_target is None:
+            self._mission_stall_started = 0.0
+            return
+
+        current_x = float(data.get("x", 0.0))
+        current_y = float(data.get("y", 0.0))
+        remaining_xy = math.hypot(
+            self._active_target[0] - current_x,
+            self._active_target[1] - current_y,
+        )
+        speed = float(data.get("speed", 0.0))
+        if remaining_xy <= 2.0 or speed > 0.35:
+            self._mission_stall_started = 0.0
+            return
+
+        now = time.monotonic()
+        if self._mission_stall_started <= 0.0:
+            self._mission_stall_started = now
+            return
+        if now - self._mission_stall_started < 2.5:
+            return
+        if now - self._last_stall_recovery < 4.0:
+            return
+
+        self._last_stall_recovery = now
+        self._mission_stall_started = 0.0
+        try:
+            self.worker.discard_pending_navigation()
+            self._plan_and_fly(replan=True, reset_avoidance=False)
+            self._avoidance_grace_until = now + 2.0
+            self.message_label.setText(
+                f"비행 정지 감지 · 남은 거리 {remaining_xy:.1f}m · "
+                "안전 경로를 자동 재전송했습니다."
+            )
+        except Exception as exc:
+            self.message_label.setText(
+                f"비행 정지 감지 · 안전 경로 재확인 중: {exc}"
+            )
 
     def _safe_terminal_descent_altitude(
         self,
@@ -1518,6 +2012,12 @@ class MissionControlWindow(QMainWindow):
             if not name.startswith("_") and isinstance(data, bytes)
         }
         self.camera_viewer.update_images(camera_images, detections)
+        self.recorder.capture(
+            images,
+            detections,
+            self._collection_mission_metadata(),
+        )
+        self._refresh_collection_status()
         if detection_error and not self._detection_error_reported:
             self._detection_error_reported = True
             self.message_label.setText(
@@ -1736,9 +2236,10 @@ class MissionControlWindow(QMainWindow):
 
         Echo 반사점을 표시하고 객체명이 확인된 적 표적을 회피 지도에 융합합니다.
         """
+        data = dict(snapshot)
+        self.recorder.update_radar(data)
         if not self.radar_checkbox.isChecked():
             return
-        data = dict(snapshot)
         points = np.asarray(data.get("points", []), dtype=np.float32).reshape((-1, 3))
         if not points.size:
             self._latest_radar_tracks = []
@@ -1975,9 +2476,10 @@ class MissionControlWindow(QMainWindow):
         self._refresh_obstacle_map()
 
     def _on_lidar(self, snapshot: object) -> None:
+        points, pose = snapshot
+        self.recorder.update_lidar(points, pose)
         if not self.lidar_checkbox.isChecked():
             return
-        points, pose = snapshot
         self.lidar_viewer.update_points(points)
         if not points.size:
             self._latest_lidar_world = np.empty((0, 3), dtype=np.float32)
@@ -2152,20 +2654,33 @@ class MissionControlWindow(QMainWindow):
             self._obstacle_detection_count = 0
 
     def _on_command_completed(self, command: str) -> None:
+        if command == "takeoff":
+            self._takeoff_pending = False
+            self.takeoff_button.setEnabled(self._connected)
         names = {
             "arm": "ARM/DISARM 명령 전송",
             "spawn": "선택한 스폰 A 위치를 적용했습니다.",
-            "takeoff": "이륙 명령 전송",
+            "takeoff": "이륙 완료 · 설정한 고도에 도달했습니다.",
             "hover": "호버링 명령 전송",
             "mission_stop": "미션 중지 · 현재 위치 호버링",
             "move": "목적지 이동 시작",
-            "path": "패턴 미션 시작",
+            "path": "경로 비행 시작",
             "land": "빠른 접근 착륙 명령 전송",
             "emergency": "긴급 정지 명령 전송",
+            "segmentation": "Segmentation 클래스를 현재 레벨에 다시 적용했습니다.",
         }
         self.message_label.setText(names.get(command, command))
 
     def _on_error(self, message: str) -> None:
+        if message.startswith(("connect:", "disconnect:")):
+            self._connection_transition = None
+            self.connect_button.setEnabled(True)
+            self.connect_button.setText(
+                "연결 해제" if self._connected else "AirSim 연결"
+            )
+        if message.startswith("takeoff:"):
+            self._takeoff_pending = False
+            self.takeoff_button.setEnabled(self._connected)
         self.message_label.setText(message)
         if not message.startswith(("센서:", "카메라:", "LiDAR:", "Radar:")):
             QMessageBox.warning(self, "Mission Control", message)
@@ -2189,6 +2704,32 @@ class MissionControlWindow(QMainWindow):
         except (TypeError, ValueError, json.JSONDecodeError):
             self._route_waypoints = []
         self._refresh_route_list()
+        self.dataset_name_edit.setText(
+            str(self.settings.value("collection_dataset_name", "KoreaDroneDataset"))
+        )
+        self.city_edit.setText(str(self.settings.value("collection_city", "AirBase")))
+        self.region_edit.setText(
+            str(self.settings.value("collection_region", "default"))
+        )
+        self.terrain_combo.setCurrentText(
+            str(self.settings.value("collection_terrain", "산업·공항"))
+        )
+        self.collection_root_edit.setText(
+            str(
+                self.settings.value(
+                    "collection_root",
+                    str(Path.home() / "Documents" / "AutonomousDroneDatasets"),
+                )
+            )
+        )
+        self.collection_rate.setValue(
+            float(self.settings.value("collection_rate_hz", 2.0))
+        )
+        for key, checkbox in self.collection_sensor_checks.items():
+            stored = str(
+                self.settings.value(f"collection_sensor_{key}", "true")
+            ).strip().lower()
+            checkbox.setChecked(stored not in {"false", "0", "no", "off"})
 
     def _save_settings(self) -> None:
         self.settings.setValue("takeoff_altitude", self.takeoff_altitude.value())
@@ -2201,9 +2742,18 @@ class MissionControlWindow(QMainWindow):
             self.patrol_duration_minutes.value(),
         )
         self.settings.setValue("route_waypoints", json.dumps(self._route_waypoints))
+        self.settings.setValue("collection_dataset_name", self.dataset_name_edit.text())
+        self.settings.setValue("collection_city", self.city_edit.text())
+        self.settings.setValue("collection_region", self.region_edit.text())
+        self.settings.setValue("collection_terrain", self.terrain_combo.currentText())
+        self.settings.setValue("collection_root", self.collection_root_edit.text())
+        self.settings.setValue("collection_rate_hz", self.collection_rate.value())
+        for key, checkbox in self.collection_sensor_checks.items():
+            self.settings.setValue(f"collection_sensor_{key}", checkbox.isChecked())
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         self._save_settings()
+        self.recorder.stop(timeout_seconds=5.0)
         self.worker.stop()
         self.worker.wait(2500)
         event.accept()
@@ -2221,6 +2771,10 @@ class MissionControlWindow(QMainWindow):
             QPushButton#emergency { background:#8f2735; border-color:#d94c5d; font-weight:700; }
             QDoubleSpinBox { background:#0f141b; border:1px solid #3a4658; border-radius:4px; padding:5px; }
             QTabWidget::pane { border:1px solid #354052; }
+            QScrollArea#controlScroll { background:#151a22; border:none; }
+            QScrollBar:vertical { background:#151a22; width:12px; margin:0; }
+            QScrollBar::handle:vertical { background:#45546a; min-height:36px; border-radius:5px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
             QTabBar::tab { background:#202936; padding:9px 16px; }
             QTabBar::tab:selected { background:#31547a; }
             QLabel#title { font-size:18px; font-weight:800; color:#d8edff; }

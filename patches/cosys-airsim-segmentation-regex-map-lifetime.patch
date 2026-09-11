@@ -1,0 +1,27 @@
+diff --git a/Source/SimMode/SimModeBase.cpp b/Source/SimMode/SimModeBase.cpp
+--- a/Source/SimMode/SimModeBase.cpp
++++ b/Source/SimMode/SimModeBase.cpp
+@@ -822,16 +822,20 @@ bool ASimModeBase::SetMeshInstanceSegmentationID(const std::string& mesh_name, i
+ 	if (is_name_regex) {
+ 		std::regex name_regex;
+ 		name_regex.assign(mesh_name, std::regex_constants::icase);
++        // Keep the returned map alive for the complete iteration. Iterating
++        // directly over GetNameToComponentMap() used an iterator into a
++        // temporary TMap and produced stale/null component pointers.
++        const TMap<FString, UMeshComponent*> name_to_component_map = instance_segmentation_annotator_.GetNameToComponentMap();
+ 		int changes = 0;
+-		for (auto It = instance_segmentation_annotator_.GetNameToComponentMap().CreateConstIterator(); It; ++It)
++		for (auto It = name_to_component_map.CreateConstIterator(); It; ++It)
+ 		{
+ 			if (std::regex_match(TCHAR_TO_UTF8(*It.Key()), name_regex)) {
+-				bool success;
++				bool success = false;
+ 				FString key = It.Key();
+ 				UAirBlueprintLib::RunCommandOnGameThread([this, key, object_id, &success]() {
+ 					success = instance_segmentation_annotator_.SetComponentRGBColorByIndex(key, object_id);
+ 				}, true);
+-				changes++;
++                if (success) changes++;
+ 			}
+ 		}
+         if(update_annotation && changes > 0)updateInstanceSegmentationAnnotation();

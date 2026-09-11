@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from typing import Iterable
 
 import cosysairsim as airsim
@@ -11,6 +12,7 @@ import numpy as np
 from common.coordinates import altitude_to_ned_z, radians_to_degrees
 from common.safety import validate_destination
 from perception.radar_processor import RadarProcessor
+from perception.segmentation_labels import configure_air_sim_segmentation
 from perception.target_detector import TargetDetector
 
 
@@ -31,6 +33,9 @@ class AirSimController:
         self.client: airsim.MultirotorClient | None = None
         self._enemy_detection_ready = False
         self._enemy_detection_error = ""
+        self._segmentation_report: dict[str, object] = {}
+        self._segmentation_error = ""
+        self._last_segmentation_refresh = 0.0
 
     @property
     def connected(self) -> bool:
@@ -49,6 +54,112 @@ class AirSimController:
             raise ConnectionError("AirSim RPC ping에 실패했습니다.")
         self.client = client
         self._configure_enemy_detection()
+
+    @property
+    def segmentation_status(self) -> str:
+        if self._segmentation_error:
+            return "Segmentation 규칙 미적용"
+        class_count = int(self._segmentation_report.get("class_count", 0))
+        object_count = int(self._segmentation_report.get("object_count", 0))
+        assigned_count = int(self._segmentation_report.get("assigned_count", 0))
+        if class_count:
+            return (
+                f"Segmentation {class_count}개 클래스 · "
+                f"객체 {assigned_count}/{object_count} 적용"
+            )
+        return "Segmentation 대기"
+
+    def _configure_segmentation_labels(self) -> None:
+        """Apply the shared semantic class map to the current Unreal level.
+
+        현재 Unreal 레벨의 메시를 공통 Semantic 클래스 ID로 통일합니다.
+        """
+        self._segmentation_report = {}
+        self._segmentation_error = ""
+        try:
+            self._segmentation_report = configure_air_sim_segmentation(
+                self._require_client()
+            )
+            self._last_segmentation_refresh = time.monotonic()
+        except Exception as exc:
+            # Flight and the existing preview remain usable if an older server
+            # does not expose the segmentation assignment RPC.
+            self._segmentation_error = str(exc)
+
+    def configure_segmentation_labels(self) -> str:
+        """Reapply semantic IDs after a level or spawned-object change."""
+        self._configure_segmentation_labels()
+        return self.segmentation_status
+
+    @staticmethod
+    def build_segmentation_report(
+        host: str = "127.0.0.1",
+        port: int = 41451,
+    ) -> dict[str, object]:
+        """Build semantic assignments with an independent RPC connection.
+
+        The main flight client must remain responsive while a large Unreal
+        level updates thousands of segmentation components.
+        대형 레벨의 수천 Segmentation 컴포넌트를 갱신하는 동안에도 주 비행
+        클라이언트가 응답하도록 별도의 RPC 연결을 사용합니다.
+        """
+        with socket.create_connection((host, port), timeout=1.5):
+            pass
+        client = airsim.MultirotorClient(
+            ip=host,
+            port=port,
+            timeout_value=45,
+        )
+        if not client.ping():
+            raise ConnectionError("Segmentation 설정용 AirSim RPC ping에 실패했습니다.")
+        return configure_air_sim_segmentation(client)
+
+    def apply_segmentation_report(self, report: dict[str, object]) -> None:
+        """Publish a report produced by the background segmentation client."""
+        self._segmentation_report = dict(report)
+        self._segmentation_error = ""
+        self._last_segmentation_refresh = time.monotonic()
+
+    def apply_segmentation_error(self, error: str) -> None:
+        """Publish a non-fatal background segmentation failure."""
+        self._segmentation_error = str(error)
+
+    def _refresh_segmentation_labels(self) -> None:
+        """Assign semantic IDs to people/birds spawned after connection."""
+        now = time.monotonic()
+        if now - self._last_segmentation_refresh < 2.0:
+            return
+        self._last_segmentation_refresh = now
+        client = self._require_client()
+        try:
+            runtime_names = {
+                str(name) for name in client.simListInstanceSegmentationObjects()
+            }
+            known_assignments = dict(
+                self._segmentation_report.get("assignments", {})
+            )
+            new_names = sorted(runtime_names - set(known_assignments))
+            if not new_names:
+                return
+            update = configure_air_sim_segmentation(
+                client,
+                object_names=new_names,
+            )
+            known_assignments.update(dict(update.get("assignments", {})))
+            class_counts = dict(self._segmentation_report.get("class_counts", {}))
+            for name, count in dict(update.get("class_counts", {})).items():
+                class_counts[str(name)] = int(class_counts.get(str(name), 0)) + int(count)
+            self._segmentation_report.update(
+                {
+                    "object_count": len(runtime_names),
+                    "assigned_count": len(known_assignments),
+                    "assignments": known_assignments,
+                    "class_counts": class_counts,
+                }
+            )
+            self._segmentation_error = ""
+        except Exception as exc:
+            self._segmentation_error = str(exc)
 
     def _configure_enemy_detection(self) -> None:
         """Register simulator filters for drones, people, and flocking birds.
@@ -121,6 +232,9 @@ class AirSimController:
                 pass
         self.client = None
         self._enemy_detection_ready = False
+        self._segmentation_report = {}
+        self._segmentation_error = ""
+        self._last_segmentation_refresh = 0.0
 
     def _require_client(self) -> airsim.MultirotorClient:
         if self.client is None:
@@ -158,6 +272,7 @@ class AirSimController:
         kin = state.kinematics_estimated
         roll, pitch, yaw = airsim.quaternion_to_euler_angles(kin.orientation)
         return points, {
+            "timestamp": int(getattr(data, "time_stamp", 0)),
             "x": float(kin.position.x_val),
             "y": float(kin.position.y_val),
             "z": float(kin.position.z_val),
@@ -226,14 +341,67 @@ class AirSimController:
     def takeoff(self, altitude_m: float) -> None:
         client = self._require_client()
         validate_destination(0.0, 0.0, altitude_m, 2.0)
+        # A path/hover command left active on the server can immediately
+        # replace a new take-off request. Start from a known command state.
+        # 서버에 남은 경로/호버 명령이 새 이륙 요청을 덮어쓸 수 있으므로
+        # 기존 비동기 작업을 먼저 취소합니다.
+        client.cancelLastTask(vehicle_name=self.vehicle_name)
         client.enableApiControl(True, vehicle_name=self.vehicle_name)
-        client.armDisarm(True, vehicle_name=self.vehicle_name)
-        client.takeoffAsync(vehicle_name=self.vehicle_name).join()
-        client.moveToZAsync(
-            altitude_to_ned_z(altitude_m),
-            velocity=2.0,
-            vehicle_name=self.vehicle_name,
+        api_enabled = bool(
+            client.isApiControlEnabled(vehicle_name=self.vehicle_name)
         )
+        if not api_enabled:
+            # SimpleFlight can need one short retry immediately after PIE or
+            # after control was released by a previous disconnect.
+            # PIE 직후 또는 연결 해제 뒤에는 제어권 반영이 늦을 수 있어
+            # 한 번 짧게 재시도합니다.
+            time.sleep(0.2)
+            client.enableApiControl(True, vehicle_name=self.vehicle_name)
+            api_enabled = bool(
+                client.isApiControlEnabled(vehicle_name=self.vehicle_name)
+            )
+        if not api_enabled:
+            raise RuntimeError("AirSim API 제어권을 얻지 못했습니다.")
+
+        armed = bool(client.armDisarm(True, vehicle_name=self.vehicle_name))
+        if not armed:
+            time.sleep(0.25)
+            armed = bool(client.armDisarm(True, vehicle_name=self.vehicle_name))
+        if not armed:
+            raise RuntimeError("드론 ARM에 실패했습니다. 충돌 또는 스폰 상태를 확인하세요.")
+
+        state = client.getMultirotorState(vehicle_name=self.vehicle_name)
+        if state.landed_state == airsim.LandedState.Landed:
+            client.takeoffAsync(
+                timeout_sec=20,
+                vehicle_name=self.vehicle_name,
+            ).join()
+
+        target_z = altitude_to_ned_z(altitude_m)
+        state = client.getMultirotorState(vehicle_name=self.vehicle_name)
+        current_altitude = -float(state.kinematics_estimated.position.z_val)
+        timeout_seconds = max(
+            8.0,
+            abs(float(altitude_m) - current_altitude) + 3.0,
+        )
+        client.moveToZAsync(
+            target_z,
+            velocity=2.0,
+            timeout_sec=timeout_seconds,
+            yaw_mode=airsim.YawMode(False, 0),
+            vehicle_name=self.vehicle_name,
+        ).join()
+
+        reached_state = client.getMultirotorState(vehicle_name=self.vehicle_name)
+        reached_altitude = -float(
+            reached_state.kinematics_estimated.position.z_val
+        )
+        if abs(reached_altitude - float(altitude_m)) > 0.8:
+            client.hoverAsync(vehicle_name=self.vehicle_name)
+            raise RuntimeError(
+                f"이륙은 시작됐지만 목표 고도에 도달하지 못했습니다. "
+                f"현재 {reached_altitude:.1f}m / 목표 {float(altitude_m):.1f}m"
+            )
 
     def hover(self) -> None:
         self._require_client().hoverAsync(vehicle_name=self.vehicle_name)
@@ -442,6 +610,7 @@ class AirSimController:
         roll, pitch, yaw = airsim.quaternion_to_euler_angles(kin.orientation)
         velocity = kin.linear_velocity
         return {
+            "timestamp": int(getattr(state, "timestamp", 0)),
             "landed": str(state.landed_state).split(".")[-1],
             "x": float(kin.position.x_val),
             "y": float(kin.position.y_val),
@@ -478,6 +647,17 @@ class AirSimController:
             for name, response in zip(names, responses)
             if response.image_data_uint8
         }
+        images["_camera_timestamps"] = {
+            name: int(getattr(response, "time_stamp", 0))
+            for name, response in zip(names, responses)
+        }
+        images["_camera_sizes"] = {
+            name: {
+                "width": int(getattr(response, "width", 0)),
+                "height": int(getattr(response, "height", 0)),
+            }
+            for name, response in zip(names, responses)
+        }
         if self._enemy_detection_ready and responses:
             try:
                 raw_detections = self._require_client().simGetDetections(
@@ -496,6 +676,13 @@ class AirSimController:
                 self._enemy_detection_error = str(exc)
         if self._enemy_detection_error:
             images["_detection_error"] = self._enemy_detection_error
+        if self._segmentation_report:
+            images["_segmentation_class_map"] = self._segmentation_report.get(
+                "classes",
+                [],
+            )
+        if self._segmentation_error:
+            images["_segmentation_error"] = self._segmentation_error
         return images
 
     def lidar_points(self) -> np.ndarray:

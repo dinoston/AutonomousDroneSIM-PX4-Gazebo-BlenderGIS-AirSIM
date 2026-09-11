@@ -6,6 +6,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QWidget
 
+from perception.segmentation_labels import load_segmentation_classes
+
 
 class CameraPanel(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
@@ -144,6 +146,24 @@ class CameraViewer(QWidget):
         layout.addWidget(self.panels["RGB"], 0, 0)
         layout.addWidget(self.panels["Depth"], 0, 1)
         layout.addWidget(self.panels["Segmentation"], 1, 0, 1, 2)
+        classes = load_segmentation_classes()
+        legend_items = []
+        for definition in classes:
+            if definition.name == "background":
+                continue
+            red, green, blue = definition.color_rgb
+            legend_items.append(
+                f'<span style="color:rgb({red},{green},{blue});">'
+                f"■ {definition.name_ko}</span>"
+            )
+        self.segmentation_legend = QLabel(
+            "Semantic 클래스 · " + " &nbsp; ".join(legend_items)
+        )
+        self.segmentation_legend.setWordWrap(True)
+        self.segmentation_legend.setStyleSheet(
+            "background:#10151d; color:#d4dde8; padding:6px;"
+        )
+        layout.addWidget(self.segmentation_legend, 2, 0, 1, 2)
 
     def update_images(
         self,
