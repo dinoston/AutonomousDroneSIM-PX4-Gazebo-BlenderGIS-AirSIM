@@ -53,6 +53,13 @@ class RecordingConfig:
     terrain_type: str
     sensors: tuple[str, ...]
     sample_rate_hz: float = 2.0
+    season: str = "summer"
+    time_of_day: str = "noon"
+    visibility: str = "clear"
+    precipitation: str = "none"
+    precipitation_intensity: float = 0.0
+    wind_north_mps: float = 0.0
+    wind_east_mps: float = 0.0
 
     def normalized(self) -> "RecordingConfig":
         allowed = {*IMAGE_SENSOR_KEYS, "lidar", "radar", "telemetry", "annotations"}
@@ -67,6 +74,38 @@ class RecordingConfig:
             terrain_type=_safe_name(self.terrain_type, "unknown_terrain"),
             sensors=selected,
             sample_rate_hz=min(10.0, max(0.5, float(self.sample_rate_hz))),
+            season=(
+                self.season
+                if self.season in {"spring", "summer", "autumn", "winter"}
+                else "summer"
+            ),
+            time_of_day=(
+                self.time_of_day
+                if self.time_of_day
+                in {"morning", "noon", "evening", "midnight", "day", "night"}
+                else "noon"
+            ),
+            visibility=(
+                self.visibility
+                if self.visibility in {"clear", "cloudy", "fog"}
+                else "clear"
+            ),
+            precipitation=(
+                self.precipitation
+                if self.precipitation in {"none", "rain", "snow"}
+                else "none"
+            ),
+            precipitation_intensity=min(
+                1.0,
+                max(
+                    0.0,
+                    float(self.precipitation_intensity)
+                    if self.precipitation in {"rain", "snow"}
+                    else 0.0,
+                ),
+            ),
+            wind_north_mps=min(30.0, max(-30.0, float(self.wind_north_mps))),
+            wind_east_mps=min(30.0, max(-30.0, float(self.wind_east_mps))),
         )
 
 

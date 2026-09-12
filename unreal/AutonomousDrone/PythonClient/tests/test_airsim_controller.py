@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from types import SimpleNamespace
 
 import cosysairsim as airsim
@@ -75,6 +76,31 @@ class _FakeFlightClient:
         return _Future()
 
 
+class _FakeEnvironmentClient:
+    def __init__(self) -> None:
+        self.time_of_day: tuple | None = None
+        self.weather_enabled = False
+        self.weather: dict[int, float] = {}
+        self.console_commands: list[str] = []
+        self.wind = None
+
+    def simSetTimeOfDay(self, *args) -> None:
+        self.time_of_day = args
+
+    def simEnableWeather(self, enabled: bool) -> None:
+        self.weather_enabled = enabled
+
+    def simSetWeatherParameter(self, parameter: int, value: float) -> None:
+        self.weather[int(parameter)] = float(value)
+
+    def simRunConsoleCommand(self, command: str) -> bool:
+        self.console_commands.append(command)
+        return True
+
+    def simSetWind(self, wind) -> None:
+        self.wind = wind
+
+
 def test_takeoff_cancels_old_task_and_waits_for_target_altitude() -> None:
     controller = AirSimController()
     client = _FakeFlightClient()
@@ -86,6 +112,62 @@ def test_takeoff_cancels_old_task_and_waits_for_target_altitude() -> None:
     assert client.takeoff_future is not None and client.takeoff_future.joined
     assert client.move_future is not None and client.move_future.joined
     assert client.z == -5.0
+
+
+def test_environment_applies_reproducible_rain_midnight_and_wind() -> None:
+    controller = AirSimController()
+    client = _FakeEnvironmentClient()
+    controller.client = client
+
+    result = controller.set_environment(
+        "winter", "midnight", "cloudy", "rain", 0.75, 8.0, -3.0
+    )
+
+    assert client.time_of_day is None
+    assert client.weather_enabled
+    assert client.weather[int(airsim.WeatherParameter.Rain)] == 0.75
+    assert math.isclose(
+        client.weather[int(airsim.WeatherParameter.Roadwetness)], 0.6
+    )
+    assert client.weather[int(airsim.WeatherParameter.Snow)] == 0.0
+    assert client.weather[int(airsim.WeatherParameter.Fog)] == 0.05
+    assert client.console_commands == [
+        "r.VolumetricCloud 1",
+        "r.EyeAdaptationQuality 0",
+        "DroneEnv.ApplyGoodSky 0.0 cloudy rain 0.750 winter",
+    ]
+    assert result["volumetric_clouds"] is True
+    assert client.wind.x_val == 8.0
+    assert client.wind.y_val == -3.0
+    assert result["precipitation"] == "rain"
+    assert result["season"] == "winter"
+
+
+def test_environment_apply_does_not_block_worker_command_loop() -> None:
+    worker = AirSimWorker()
+    worker.controller.client = object()
+    started = threading.Event()
+    release = threading.Event()
+    original_apply = AirSimController.apply_environment_once
+
+    def slow_apply(*_args) -> dict[str, object]:
+        started.set()
+        release.wait(timeout=1.0)
+        return {}
+
+    AirSimController.apply_environment_once = staticmethod(slow_apply)
+    try:
+        started_at = time.monotonic()
+        worker._start_environment_apply(
+            ("summer", "noon", "clear", "none", 0.0, 0.0, 0.0)
+        )
+        elapsed = time.monotonic() - started_at
+        assert elapsed < 0.2
+        assert started.wait(timeout=0.5)
+        assert worker._environment_apply_running
+    finally:
+        release.set()
+        AirSimController.apply_environment_once = original_apply
 
 
 def test_connect_does_not_wait_for_semantic_setup() -> None:

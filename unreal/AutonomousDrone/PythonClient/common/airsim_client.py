@@ -338,6 +338,180 @@ class AirSimController:
         if not self._require_client().simRunConsoleCommand(command):
             raise RuntimeError(f"언리얼 콘솔 명령을 실행하지 못했습니다: {command}")
 
+    @staticmethod
+    def apply_environment_once(
+        host: str,
+        port: int,
+        season: str,
+        time_of_day: str,
+        visibility: str,
+        precipitation: str,
+        precipitation_intensity: float,
+        wind_north_mps: float = 0.0,
+        wind_east_mps: float = 0.0,
+    ) -> dict[str, object]:
+        """Apply weather through a short-lived RPC client with a finite timeout.
+
+        Good SKY can briefly rebuild render state while a preset changes.  A
+        dedicated client prevents that work from holding the flight/sensor
+        worker, and the timeout guarantees that the UI can recover if PIE is
+        stopping or Unreal does not answer.
+        """
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.5):
+                pass
+        except OSError as exc:
+            raise ConnectionError(
+                "AirSim RPC 서버가 열려 있지 않습니다. Unreal Play 상태를 확인하세요."
+            ) from exc
+        controller = AirSimController(host=host, port=int(port))
+        controller.client = airsim.MultirotorClient(
+            ip=host,
+            port=int(port),
+            timeout_value=8,
+        )
+        if not controller.client.ping():
+            raise ConnectionError("환경 설정용 AirSim RPC ping에 실패했습니다.")
+        return controller.set_environment(
+            season,
+            time_of_day,
+            visibility,
+            precipitation,
+            precipitation_intensity,
+            wind_north_mps,
+            wind_east_mps,
+        )
+
+    def set_environment(
+        self,
+        season: str,
+        time_of_day: str,
+        visibility: str,
+        precipitation: str,
+        precipitation_intensity: float,
+        wind_north_mps: float = 0.0,
+        wind_east_mps: float = 0.0,
+    ) -> dict[str, object]:
+        """Apply a reproducible visual/physical environment through Cosys-AirSim.
+
+        Cosys-AirSim directly controls sun time, precipitation, fog, road state,
+        and physical wind. Cloud cover is not an AirSim weather parameter, so an
+        existing Unreal Volumetric Cloud actor is shown or hidden through a
+        console variable. A cloudy level therefore still needs that actor.
+
+        Cosys-AirSim으로 태양 시간, 강수, 안개, 노면과 물리 바람을 적용합니다.
+        구름량은 AirSim 날씨 파라미터가 아니므로 레벨에 배치된 Volumetric
+        Cloud 액터의 표시 여부를 언리얼 콘솔 변수로 제어합니다.
+        """
+        client = self._require_client()
+        normalized_season = str(season).strip().lower()
+        normalized_time = str(time_of_day).strip().lower()
+        # Keep older saved sessions/API callers compatible while exposing the
+        # four reproducible presets used by the Mission Control UI.
+        normalized_time = {"day": "noon", "night": "midnight"}.get(
+            normalized_time, normalized_time
+        )
+        normalized_visibility = str(visibility).strip().lower()
+        normalized_precipitation = str(precipitation).strip().lower()
+        if normalized_season not in {"spring", "summer", "autumn", "winter"}:
+            raise ValueError("계절은 spring, summer, autumn, winter 중 하나여야 합니다.")
+        if normalized_time not in {"morning", "noon", "evening", "midnight"}:
+            raise ValueError(
+                "시간대는 morning, noon, evening, midnight 중 하나여야 합니다."
+            )
+        if normalized_visibility not in {"clear", "cloudy", "fog"}:
+            raise ValueError("하늘/시정은 clear, cloudy, fog 중 하나여야 합니다.")
+        if normalized_precipitation not in {"none", "rain", "snow"}:
+            raise ValueError("강수는 none, rain, snow 중 하나여야 합니다.")
+
+        intensity = min(1.0, max(0.0, float(precipitation_intensity)))
+        if normalized_precipitation == "none":
+            intensity = 0.0
+        north = min(30.0, max(-30.0, float(wind_north_mps)))
+        east = min(30.0, max(-30.0, float(wind_east_mps)))
+
+        time_hours = {
+            "morning": 8.0,
+            "noon": 13.0,
+            "evening": 18.0,
+            "midnight": 0.0,
+        }
+        # This level uses Good SKY instead of AirSim's legacy BP_Sky_Sphere.
+        # Calling simSetTimeOfDay here only prints a red "BP_Sky_Sphere was not
+        # found" warning and has no visual effect. DroneEnv.ApplyGoodSky below
+        # owns the visible time preset.
+        client.simEnableWeather(True)
+
+        # Clear stale weather first, otherwise a previous rain/snow selection
+        # remains blended into the next preset.
+        weather_values = {
+            airsim.WeatherParameter.Rain: 0.0,
+            airsim.WeatherParameter.Roadwetness: 0.0,
+            airsim.WeatherParameter.Snow: 0.0,
+            airsim.WeatherParameter.RoadSnow: 0.0,
+            airsim.WeatherParameter.MapleLeaf: 0.0,
+            airsim.WeatherParameter.RoadLeaf: 0.0,
+            airsim.WeatherParameter.Dust: 0.0,
+            airsim.WeatherParameter.Fog: {
+                "clear": 0.0,
+                "cloudy": 0.05,
+                "fog": 0.65,
+            }[normalized_visibility],
+        }
+        if normalized_precipitation == "rain":
+            weather_values[airsim.WeatherParameter.Rain] = intensity
+            weather_values[airsim.WeatherParameter.Roadwetness] = intensity * 0.8
+        elif normalized_precipitation == "snow":
+            weather_values[airsim.WeatherParameter.Snow] = intensity
+            weather_values[airsim.WeatherParameter.RoadSnow] = intensity * 0.8
+        for parameter, value in weather_values.items():
+            client.simSetWeatherParameter(parameter, min(1.0, max(0.0, value)))
+
+        # Clear weather keeps the level VolumetricCloud out of the way. Cloudy,
+        # rain and snow explicitly enable it so those selections visibly differ
+        # even when the selected Good SKY preset has little cloud texture.
+        show_clouds = (
+            normalized_visibility == "cloudy"
+            or normalized_precipitation in {"rain", "snow"}
+        )
+        client.simRunConsoleCommand(
+            f"r.VolumetricCloud {1 if show_clouds else 0}"
+        )
+        client.simRunConsoleCommand("r.EyeAdaptationQuality 0")
+        client.simSetWind(airsim.Vector3r(north, east, 0.0))
+        good_sky_command = (
+            "DroneEnv.ApplyGoodSky "
+            f"{time_hours[normalized_time]:.1f} "
+            f"{normalized_visibility} {normalized_precipitation} {intensity:.3f} "
+            f"{normalized_season}"
+        )
+        good_sky_requested = bool(client.simRunConsoleCommand(good_sky_command))
+        if normalized_time == "morning":
+            good_sky_preset = "SunRise"
+        elif normalized_time == "evening":
+            good_sky_preset = "SunSet"
+        elif normalized_time == "midnight":
+            good_sky_preset = (
+                "Midnight Storm"
+                if normalized_precipitation in {"rain", "snow"}
+                else "Midnight Moon"
+            )
+        else:
+            good_sky_preset = "Noon Clear Sky"
+        return {
+            "season": normalized_season,
+            "time_of_day": normalized_time,
+            "visibility": normalized_visibility,
+            "precipitation": normalized_precipitation,
+            "precipitation_intensity": intensity,
+            "wind_north_mps": north,
+            "wind_east_mps": east,
+            "good_sky_requested": good_sky_requested,
+            "good_sky_command": good_sky_command,
+            "good_sky_preset": good_sky_preset,
+            "volumetric_clouds": show_clouds,
+        }
+
     def takeoff(self, altitude_m: float) -> None:
         client = self._require_client()
         validate_destination(0.0, 0.0, altitude_m, 2.0)

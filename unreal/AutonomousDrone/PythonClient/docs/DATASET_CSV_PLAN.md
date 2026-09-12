@@ -46,7 +46,7 @@
 
 - `schema_version`, `dataset_name`, `session_id`
 - `city`, `region`, `map_name`, `terrain_type`
-- `weather`, `time_of_day`, `visibility`, `scenario_id`, `random_seed`
+- `season`, `weather`, `time_of_day`, `visibility`, `scenario_id`, `random_seed`
 - 사용 센서, 샘플링 주기, 클래스 맵 버전
 - 시작·종료 시각, 저장·누락 프레임 수, 완료 상태
 
@@ -101,10 +101,13 @@
 
 ## 다음 개발 순서
 
-1. CSV 스키마 버전과 `session_id`를 확정하고 `frames.csv`, `objects.csv`,
-   `events.csv`를 기존 저장 스레드에서 함께 기록한다.
-2. 데이터 수집 UI에 맵 이름, 날씨, 시간대, 시나리오 ID, 랜덤 시드 입력을
-   추가하고 `CSV 분석용 메타데이터 저장`을 기본 활성화한다.
+현재 `frames.csv`, `objects.csv`, `session_summary.csv`와 그래프 PDF 자동 생성은
+구현되어 있다. 아래 항목은 다음 확장 단계로 진행한다.
+
+1. 비행 이벤트 기록기를 추가해 `events.csv`에 이륙, 경유지 도착, 재탐색,
+   충돌과 정지 복구를 기록한다.
+2. 날씨·시간대·강수·바람 UI 및 세션/PDF 기록은 구현되었다. 다음으로
+   시나리오 ID와 랜덤 시드를 추가해 같은 경로·환경 조건을 재현한다.
 3. 사람·새·드론에 지속적인 `track_id`를 부여하고 카메라·LiDAR·Radar 감지를
    같은 객체 행으로 융합한다.
 4. 세션 종료 시 `session_summary.csv`를 자동 생성하고 누락률·클래스 불균형·

@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QScrollArea,
     QSplitter,
     QTabWidget,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from common.airsim_client import AirSimController
 from data_collection.recorder import DataRecorder, RecordingConfig
+from data_collection.report import generate_session_report
 from navigation.grid_planner import (
     AltitudeGridPlanner,
     PlannerConfig,
@@ -66,6 +68,7 @@ class AirSimWorker(QThread):
     images_updated = Signal(dict)
     lidar_updated = Signal(object)
     radar_updated = Signal(object)
+    environment_applied = Signal(dict)
     command_completed = Signal(str)
     error_occurred = Signal(str)
 
@@ -83,6 +86,9 @@ class AirSimWorker(QThread):
         self._last_sensor_error = 0.0
         self._suspend_polling = False
         self._semantic_setup_running = False
+        self._environment_apply_running = False
+        self._queued_environment_args: tuple | None = None
+        self._environment_apply_lock = threading.Lock()
 
     def submit(self, name: str, *args, priority: int = 10) -> None:
         self._commands.put((priority, next(self._sequence), name, args))
@@ -125,6 +131,49 @@ class AirSimWorker(QThread):
         threading.Thread(
             target=configure,
             name="AirSimSemanticSetup",
+            daemon=True,
+        ).start()
+
+    def _start_environment_apply(self, args: tuple) -> None:
+        """Apply only the newest requested preset without blocking flight RPCs."""
+        with self._environment_apply_lock:
+            if self._environment_apply_running:
+                self._queued_environment_args = args
+                self.status_changed.emit(
+                    "현재 환경 적용 뒤에 방금 선택한 환경을 이어서 적용합니다."
+                )
+                return
+            self._environment_apply_running = True
+        host = self.controller.host
+        port = self.controller.port
+
+        def configure(first_args: tuple) -> None:
+            current_args = first_args
+            while self.controller.connected:
+                try:
+                    values = AirSimController.apply_environment_once(
+                        host, port, *current_args
+                    )
+                    if self.controller.connected:
+                        self.environment_applied.emit(values)
+                except Exception as exc:
+                    if self.controller.connected:
+                        self.error_occurred.emit(f"environment: {exc}")
+                with self._environment_apply_lock:
+                    next_args = self._queued_environment_args
+                    self._queued_environment_args = None
+                    if next_args is None:
+                        self._environment_apply_running = False
+                        return
+                    current_args = next_args
+            with self._environment_apply_lock:
+                self._queued_environment_args = None
+                self._environment_apply_running = False
+
+        threading.Thread(
+            target=configure,
+            args=(args,),
+            name="AirSimEnvironmentApply",
             daemon=True,
         ).start()
 
@@ -283,11 +332,18 @@ class AirSimWorker(QThread):
                     self.controller.set_sensor_debug_visualization(
                         str(args[0]), bool(args[1])
                     )
+                elif name == "environment":
+                    self._start_environment_apply(args)
                 elif name == "segmentation":
                     self._start_semantic_setup()
                 else:
                     raise ValueError(f"알 수 없는 명령: {name}")
-                if name not in {"connect", "disconnect", "segmentation"}:
+                if name not in {
+                    "connect",
+                    "disconnect",
+                    "segmentation",
+                    "environment",
+                }:
                     self.command_completed.emit(name)
             except Exception as exc:
                 if name in {"connect", "disconnect"}:
@@ -337,6 +393,24 @@ class AirSimWorker(QThread):
                 self._last_sensor_error = now
 
 
+class ReportWorker(QThread):
+    """Build CSV summaries and a PDF without blocking the flight UI."""
+
+    completed = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, session_dir: Path) -> None:
+        super().__init__()
+        self.session_dir = Path(session_dir)
+
+    def run(self) -> None:
+        try:
+            result = generate_session_report(self.session_dir)
+            self.completed.emit(str(result.pdf_path), result.summary)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MissionControlWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -346,10 +420,22 @@ class MissionControlWindow(QMainWindow):
         self.resize(1500, 920)
         self.settings = QSettings("AutonomousDrone", "MissionControl")
         self.recorder = DataRecorder()
+        self._report_worker: ReportWorker | None = None
         self._connected = False
         self._connection_transition: str | None = None
         self._semantic_ready = False
         self._takeoff_pending = False
+        self._environment_apply_pending = False
+        self._environment_requested: dict[str, object] = {}
+        self._environment_state: dict[str, object] = {
+            "season": "summer",
+            "time_of_day": "noon",
+            "visibility": "clear",
+            "precipitation": "none",
+            "precipitation_intensity": 0.0,
+            "wind_north_mps": 0.0,
+            "wind_east_mps": 0.0,
+        }
         # The AirBase capture covers 1400 m. A 2.5 m planning grid keeps
         # full-map A* practical while retaining useful obstacle clearance.
         # AirBase 캡처 범위는 1400m이며, 2.5m 격자를 사용해 전체 지도 A*의
@@ -417,6 +503,7 @@ class MissionControlWindow(QMainWindow):
         self.worker.images_updated.connect(self._on_images)
         self.worker.lidar_updated.connect(self._on_lidar)
         self.worker.radar_updated.connect(self._on_radar)
+        self.worker.environment_applied.connect(self._on_environment_applied)
         self.worker.command_completed.connect(self._on_command_completed)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.start()
@@ -623,6 +710,7 @@ class MissionControlWindow(QMainWindow):
         self.minimap.spawn_selected.connect(self._on_spawn_selected)
         self.minimap.target_selected.connect(self._on_target_selected)
         tabs.addTab(self.minimap, "미니맵 · A* 경로")
+        tabs.addTab(self._build_environment_panel(), "환경 · 날씨")
         # Keep collection next to the minimap so it remains visible even when
         # the sensor pane is narrow.
         # 센서 패널이 좁아도 수집 탭이 가려지지 않도록 두 번째에 둡니다.
@@ -631,6 +719,265 @@ class MissionControlWindow(QMainWindow):
         tabs.addTab(self.lidar_viewer, "LiDAR 3D 점군")
         tabs.addTab(self.radar_viewer, "Radar 3D 점군")
         return tabs
+
+    def _build_environment_panel(self) -> QWidget:
+        """Build deterministic weather controls used by collection sessions."""
+        contents = QWidget()
+        root = QVBoxLayout(contents)
+
+        guide_group = QGroupBox("환경 설정 사용 방법")
+        guide_layout = QVBoxLayout(guide_group)
+        guide = QLabel(
+            "1. 계절·시간대·하늘·강수를 선택  →  2. 강수량과 바람을 조절  →  "
+            "3. <b>환경 적용</b><br>"
+            "적용된 값은 다음 데이터 수집 세션의 session.json, 요약 CSV와 "
+            "PDF 보고서에 자동으로 기록됩니다. 비교 실험에서는 경로와 환경값을 "
+            "각 세션 동안 고정하는 것을 권장합니다."
+        )
+        guide.setWordWrap(True)
+        guide.setStyleSheet(
+            "background:#101722; border:1px solid #31547a; "
+            "border-radius:5px; padding:10px; color:#d8edff;"
+        )
+        guide_layout.addWidget(guide)
+        root.addWidget(guide_group)
+
+        preset_group = QGroupBox("시간·기상 선택")
+        preset_form = QFormLayout(preset_group)
+        self.season_combo = QComboBox()
+        self.season_combo.addItem("봄", "spring")
+        self.season_combo.addItem("여름", "summer")
+        self.season_combo.addItem("가을", "autumn")
+        self.season_combo.addItem("겨울", "winter")
+        self.time_of_day_combo = QComboBox()
+        self.time_of_day_combo.addItem("아침", "morning")
+        self.time_of_day_combo.addItem("점심", "noon")
+        self.time_of_day_combo.addItem("저녁", "evening")
+        self.time_of_day_combo.addItem("한밤", "midnight")
+        self.visibility_combo = QComboBox()
+        self.visibility_combo.addItem("맑음", "clear")
+        self.visibility_combo.addItem("흐림", "cloudy")
+        self.visibility_combo.addItem("안개", "fog")
+        self.precipitation_combo = QComboBox()
+        self.precipitation_combo.addItem("없음", "none")
+        self.precipitation_combo.addItem("비", "rain")
+        self.precipitation_combo.addItem("눈", "snow")
+        self.precipitation_combo.currentIndexChanged.connect(
+            self._update_environment_input_state
+        )
+        preset_form.addRow("계절", self.season_combo)
+        preset_form.addRow("시간대", self.time_of_day_combo)
+        preset_form.addRow("하늘/시정", self.visibility_combo)
+        preset_form.addRow("강수", self.precipitation_combo)
+        root.addWidget(preset_group)
+
+        detail_group = QGroupBox("강도·바람")
+        detail_form = QFormLayout(detail_group)
+        self.precipitation_intensity = self._spinbox(0.0, 1.0, 0.6, "")
+        self.precipitation_intensity.setSingleStep(0.1)
+        self.precipitation_intensity.setToolTip(
+            "비 또는 눈의 강도입니다. 0은 없음, 1은 최대 강도입니다."
+        )
+        self.wind_north = self._spinbox(-30.0, 30.0, 0.0, " m/s")
+        self.wind_north.setSingleStep(1.0)
+        self.wind_north.setToolTip("NED 기준: +는 북쪽, -는 남쪽 방향 바람입니다.")
+        self.wind_east = self._spinbox(-30.0, 30.0, 0.0, " m/s")
+        self.wind_east.setSingleStep(1.0)
+        self.wind_east.setToolTip("NED 기준: +는 동쪽, -는 서쪽 방향 바람입니다.")
+        detail_form.addRow("비/눈 강도", self.precipitation_intensity)
+        detail_form.addRow("바람 N(북+)", self.wind_north)
+        detail_form.addRow("바람 E(동+)", self.wind_east)
+        root.addWidget(detail_group)
+
+        action_group = QGroupBox("환경 제어")
+        action_layout = QGridLayout(action_group)
+        self.environment_apply_button = QPushButton("환경 적용")
+        self.environment_reset_button = QPushButton("기본값으로 선택")
+        self.environment_apply_button.clicked.connect(self._apply_environment)
+        self.environment_reset_button.clicked.connect(self._reset_environment_inputs)
+        self.environment_status_label = QLabel(
+            "현재 기록값: 여름 · 점심 · 맑음 · 강수 없음 · 무풍"
+        )
+        self.environment_status_label.setWordWrap(True)
+        self.environment_status_label.setStyleSheet(
+            "color:#8fb9dc; padding-top:4px;"
+        )
+        action_layout.addWidget(self.environment_apply_button, 0, 0)
+        action_layout.addWidget(self.environment_reset_button, 0, 1)
+        action_layout.addWidget(self.environment_status_label, 1, 0, 1, 2)
+        root.addWidget(action_group)
+
+        log_group = QGroupBox("환경 적용 로그")
+        log_layout = QVBoxLayout(log_group)
+        self.environment_log = QPlainTextEdit()
+        self.environment_log.setReadOnly(True)
+        self.environment_log.setMaximumBlockCount(100)
+        self.environment_log.setMinimumHeight(120)
+        self.environment_log.setPlaceholderText(
+            "환경 적용을 누르면 요청값과 Good SKY 프리셋 적용 결과가 표시됩니다."
+        )
+        log_layout.addWidget(self.environment_log)
+        root.addWidget(log_group)
+
+        note = QLabel(
+            "※ 흐림은 레벨의 Volumetric Cloud 액터를 표시합니다. 액터가 없으면 "
+            "구름 모양은 변하지 않습니다. Road Wetness/Road Snow는 AirSim용 "
+            "노면 머티리얼 설정이 필요합니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9eabba; padding:6px;")
+        root.addWidget(note)
+        root.addStretch()
+        self._update_environment_input_state()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(contents)
+        return scroll
+
+    def _selected_environment(self) -> dict[str, object]:
+        precipitation = str(self.precipitation_combo.currentData())
+        return {
+            "season": str(self.season_combo.currentData()),
+            "time_of_day": str(self.time_of_day_combo.currentData()),
+            "visibility": str(self.visibility_combo.currentData()),
+            "precipitation": precipitation,
+            "precipitation_intensity": (
+                float(self.precipitation_intensity.value())
+                if precipitation != "none"
+                else 0.0
+            ),
+            "wind_north_mps": float(self.wind_north.value()),
+            "wind_east_mps": float(self.wind_east.value()),
+        }
+
+    def _update_environment_input_state(self, *_args: object) -> None:
+        has_precipitation = (
+            str(self.precipitation_combo.currentData()) != "none"
+        )
+        self.precipitation_intensity.setEnabled(has_precipitation)
+
+    def _reset_environment_inputs(self) -> None:
+        self.season_combo.setCurrentIndex(
+            self.season_combo.findData("summer")
+        )
+        self.time_of_day_combo.setCurrentIndex(
+            self.time_of_day_combo.findData("noon")
+        )
+        self.visibility_combo.setCurrentIndex(
+            self.visibility_combo.findData("clear")
+        )
+        self.precipitation_combo.setCurrentIndex(
+            self.precipitation_combo.findData("none")
+        )
+        self.precipitation_intensity.setValue(0.6)
+        self.wind_north.setValue(0.0)
+        self.wind_east.setValue(0.0)
+        self._update_environment_input_state()
+        self.message_label.setText(
+            "환경 선택을 기본값으로 돌렸습니다. 실제 적용은 환경 적용을 누르세요."
+        )
+
+    def _apply_environment(self) -> None:
+        if not self._connected:
+            self._on_error("환경 설정: AirSim에 먼저 연결하세요.")
+            return
+        selected = self._selected_environment()
+        requested_time = {
+            "morning": "아침 / SunRise",
+            "noon": "점심 / Noon Clear Sky",
+            "evening": "저녁 / SunSet",
+            "midnight": "한밤 / Midnight Moon",
+        }.get(str(selected["time_of_day"]), str(selected["time_of_day"]))
+        self._append_environment_log(
+            f"요청 → {requested_time}, 하늘={selected['visibility']}, "
+            f"강수={selected['precipitation']}"
+        )
+        self._environment_apply_pending = True
+        self._environment_requested = dict(selected)
+        self.environment_apply_button.setEnabled(True)
+        self.environment_apply_button.setText("적용 중 · 최신 선택 다시 적용")
+        self.environment_status_label.setText("AirSim에 환경을 적용하는 중…")
+        self.message_label.setText("시간대·날씨·바람을 적용하고 있습니다…")
+        self.worker.submit(
+            "environment",
+            selected["season"],
+            selected["time_of_day"],
+            selected["visibility"],
+            selected["precipitation"],
+            selected["precipitation_intensity"],
+            selected["wind_north_mps"],
+            selected["wind_east_mps"],
+            priority=1,
+        )
+
+    def _on_environment_applied(self, values: dict) -> None:
+        self._environment_state = dict(values)
+        self.environment_apply_button.setEnabled(self._connected)
+        comparable_keys = {
+            "season",
+            "time_of_day",
+            "visibility",
+            "precipitation",
+            "precipitation_intensity",
+            "wind_north_mps",
+            "wind_east_mps",
+        }
+        newest_applied = all(
+            values.get(key) == self._environment_requested.get(key)
+            for key in comparable_keys
+        )
+        self._environment_apply_pending = not newest_applied
+        self.environment_apply_button.setText(
+            "변경 다시 적용" if self._environment_apply_pending else "환경 적용"
+        )
+        labels = {
+            "spring": "봄",
+            "summer": "여름",
+            "autumn": "가을",
+            "winter": "겨울",
+            "morning": "아침",
+            "noon": "점심",
+            "evening": "저녁",
+            "midnight": "한밤",
+            "day": "점심",
+            "night": "한밤",
+            "clear": "맑음",
+            "cloudy": "흐림",
+            "fog": "안개",
+            "none": "없음",
+            "rain": "비",
+            "snow": "눈",
+        }
+        season_label = labels.get(str(values.get("season")), "-")
+        time_label = labels.get(str(values.get("time_of_day")), "-")
+        visibility_label = labels.get(str(values.get("visibility")), "-")
+        precipitation_label = labels.get(
+            str(values.get("precipitation")), "-"
+        )
+        intensity = float(values.get("precipitation_intensity", 0.0))
+        north = float(values.get("wind_north_mps", 0.0))
+        east = float(values.get("wind_east_mps", 0.0))
+        description = (
+            f"{season_label} · {time_label} · {visibility_label} · 강수 {precipitation_label} "
+            f"{intensity:.1f} · 바람 N {north:.1f}, E {east:.1f} m/s"
+        )
+        self.environment_status_label.setText(f"현재 적용값: {description}")
+        self.message_label.setText(f"환경 적용 완료: {description}")
+        requested = bool(values.get("good_sky_requested", False))
+        preset = str(values.get("good_sky_preset", "알 수 없음"))
+        command = str(values.get("good_sky_command", ""))
+        self._append_environment_log(
+            f"{'완료' if requested else '실패'} → Good SKY={preset} · {command}"
+        )
+
+    def _append_environment_log(self, message: str) -> None:
+        if not hasattr(self, "environment_log"):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.environment_log.appendPlainText(f"[{timestamp}] {message}")
 
     def _build_data_collection_panel(self) -> QWidget:
         panel = QWidget()
@@ -643,7 +990,8 @@ class MissionControlWindow(QMainWindow):
             "2. 저장할 센서를 선택  →  "
             "3. <b>● 수집 시작</b>  →  "
             "4. 드론 미션 실행  →  "
-            "5. <b>■ 수집 종료</b><br>"
+            "5. <b>■ 수집 종료</b>  →  "
+            "6. 요약 CSV·그래프 PDF 자동 생성<br>"
             "RGB 프레임을 기준으로 Depth·Segmentation·LiDAR·Radar·"
             "비행 상태와 바운딩 박스를 함께 저장합니다. "
             "처음에는 기본값 2 Hz를 권장합니다."
@@ -759,6 +1107,25 @@ class MissionControlWindow(QMainWindow):
             self.collection_status_labels[key] = value
             status_form.addRow(label, value)
         root.addWidget(status_group)
+
+        report_group = QGroupBox("수집 결과 분석")
+        report_layout = QGridLayout(report_group)
+        self.auto_report_checkbox = QCheckBox("수집 종료 후 요약·그래프 PDF 자동 생성")
+        self.auto_report_checkbox.setChecked(True)
+        self.current_report_button = QPushButton("현재 세션 PDF 다시 생성")
+        self.existing_report_button = QPushButton("기존 세션 폴더 분석")
+        self.current_report_button.clicked.connect(self._generate_current_report)
+        self.existing_report_button.clicked.connect(self._select_existing_session_report)
+        self.report_status_label = QLabel(
+            "수집을 종료하면 analysis 폴더에 CSV 3개와 PDF 보고서가 생성됩니다."
+        )
+        self.report_status_label.setWordWrap(True)
+        self.report_status_label.setStyleSheet("color:#8fb9dc; padding-top:4px;")
+        report_layout.addWidget(self.auto_report_checkbox, 0, 0, 1, 2)
+        report_layout.addWidget(self.current_report_button, 1, 0)
+        report_layout.addWidget(self.existing_report_button, 1, 1)
+        report_layout.addWidget(self.report_status_label, 2, 0, 1, 2)
+        root.addWidget(report_group)
         root.addStretch()
         self._refresh_collection_status()
         return panel
@@ -808,6 +1175,15 @@ class MissionControlWindow(QMainWindow):
                 terrain_type=self.terrain_combo.currentText(),
                 sensors=sensors,
                 sample_rate_hz=float(self.collection_rate.value()),
+                season=str(self._environment_state["season"]),
+                time_of_day=str(self._environment_state["time_of_day"]),
+                visibility=str(self._environment_state["visibility"]),
+                precipitation=str(self._environment_state["precipitation"]),
+                precipitation_intensity=float(
+                    self._environment_state["precipitation_intensity"]
+                ),
+                wind_north_mps=float(self._environment_state["wind_north_mps"]),
+                wind_east_mps=float(self._environment_state["wind_east_mps"]),
             )
             # Camera frames are the synchronization boundary. Requested range
             # sensors are also enabled so their nearest samples are available.
@@ -844,6 +1220,61 @@ class MissionControlWindow(QMainWindow):
             f"데이터 수집 종료 · {stats['written_frames']}프레임 · "
             f"{self._format_bytes(int(stats['bytes_written']))}"
         )
+        self._refresh_collection_status()
+        session_dir = self.recorder.session_dir
+        if (
+            self.auto_report_checkbox.isChecked()
+            and session_dir is not None
+            and stats["state"] == "stopped"
+        ):
+            self._start_report_generation(session_dir)
+
+    def _generate_current_report(self) -> None:
+        session_dir = self.recorder.session_dir
+        if session_dir is None:
+            self._on_error("분석할 현재 데이터 수집 세션이 없습니다.")
+            return
+        self._start_report_generation(session_dir)
+
+    def _select_existing_session_report(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "session.json과 frames.jsonl이 있는 세션 폴더 선택",
+            self.collection_root_edit.text(),
+        )
+        if selected:
+            self._start_report_generation(Path(selected))
+
+    def _start_report_generation(self, session_dir: Path) -> None:
+        if self._report_worker is not None and self._report_worker.isRunning():
+            self.message_label.setText("데이터 분석 보고서를 이미 생성 중입니다.")
+            return
+        if self.recorder.state in {"recording", "paused", "stopping"}:
+            self._on_error("데이터 수집을 종료한 뒤 보고서를 생성하세요.")
+            return
+        self._report_worker = ReportWorker(Path(session_dir))
+        self._report_worker.completed.connect(self._on_report_completed)
+        self._report_worker.failed.connect(self._on_report_failed)
+        self._report_worker.finished.connect(self._refresh_collection_status)
+        self.current_report_button.setEnabled(False)
+        self.existing_report_button.setEnabled(False)
+        self.report_status_label.setText("세션 요약·CSV·그래프 PDF 생성 중…")
+        self.message_label.setText("데이터 수집 결과를 분석하고 있습니다…")
+        self._report_worker.start()
+
+    def _on_report_completed(self, pdf_path: str, summary: object) -> None:
+        values = summary if isinstance(summary, dict) else {}
+        frames = int(values.get("written_frames", 0))
+        detections = int(values.get("detection_rows", 0))
+        self.report_status_label.setText(
+            f"완료 · {frames}프레임 · 객체 탐지 {detections}건\n{pdf_path}"
+        )
+        self.message_label.setText(f"데이터 분석 PDF 생성 완료: {pdf_path}")
+        self._refresh_collection_status()
+
+    def _on_report_failed(self, error: str) -> None:
+        self.report_status_label.setText(f"보고서 생성 실패: {error}")
+        self.message_label.setText(f"데이터 분석 보고서 생성 실패: {error}")
         self._refresh_collection_status()
 
     def _reapply_segmentation(self) -> None:
@@ -926,6 +1357,14 @@ class MissionControlWindow(QMainWindow):
             "수집 재개" if state == "paused" else "일시정지"
         )
         self.collection_stop_button.setEnabled(state in {"recording", "paused"})
+        report_busy = self._report_worker is not None and self._report_worker.isRunning()
+        has_session = bool(stats["session_dir"])
+        self.current_report_button.setEnabled(
+            has_session
+            and state not in {"recording", "paused", "stopping"}
+            and not report_busy
+        )
+        self.existing_report_button.setEnabled(not report_busy)
         error = str(stats.get("last_error", ""))
         if error and error != self._last_collection_error:
             self._last_collection_error = error
@@ -1546,6 +1985,7 @@ class MissionControlWindow(QMainWindow):
         self.connect_button.setEnabled(True)
         if not connected:
             self._takeoff_pending = False
+            self._environment_apply_pending = False
         if not connected and self.recorder.state in {"recording", "paused"}:
             self.recorder.stop()
         self.status_indicator.setText(f"● {message}")
@@ -1557,9 +1997,18 @@ class MissionControlWindow(QMainWindow):
         # Unreal/AirSim RPC server. Starting flight during that window can trip
         # SimpleFlight's API watchdog and leave the drone hovering.
         # Segmentation 초기화가 끝나기 전에 비행을 시작하지 않도록 합니다.
-        self._set_controls_enabled(connected and self._semantic_ready)
+        # Flight control is ready as soon as the primary AirSim RPC connects.
+        # Semantic setup continues in the background and gates only collection.
+        # 비행 버튼은 즉시 활성화하고, 데이터 수집만 Semantic 준비를 기다립니다.
+        self._set_controls_enabled(connected)
         self.message_label.setText(message)
         self._refresh_collection_status()
+        if connected:
+            # Restore and apply the last selected environment on every new PIE
+            # connection so recorded metadata always matches the simulator.
+            # PIE 재연결마다 마지막 환경 선택을 다시 적용하여 저장 조건과
+            # 실제 시뮬레이터 상태가 어긋나지 않도록 합니다.
+            self._apply_environment()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -1575,6 +2024,7 @@ class MissionControlWindow(QMainWindow):
             self.start_patrol_button,
             self.stop_patrol_button,
             self.segmentation_apply_button,
+            self.environment_apply_button,
         ):
             widget.setEnabled(enabled)
         self._refresh_collection_status()
@@ -2681,6 +3131,14 @@ class MissionControlWindow(QMainWindow):
         if message.startswith("takeoff:"):
             self._takeoff_pending = False
             self.takeoff_button.setEnabled(self._connected)
+        if message.startswith("environment:"):
+            self._environment_apply_pending = False
+            self.environment_apply_button.setEnabled(self._connected)
+            self.environment_apply_button.setText("환경 적용")
+            self.environment_status_label.setText(
+                "환경 적용 실패 · 이전 적용값을 계속 기록합니다."
+            )
+            self._append_environment_log(f"오류 → {message}")
         self.message_label.setText(message)
         if not message.startswith(("센서:", "카메라:", "LiDAR:", "Radar:")):
             QMessageBox.warning(self, "Mission Control", message)
@@ -2730,6 +3188,27 @@ class MissionControlWindow(QMainWindow):
                 self.settings.value(f"collection_sensor_{key}", "true")
             ).strip().lower()
             checkbox.setChecked(stored not in {"false", "0", "no", "off"})
+        auto_report = str(
+            self.settings.value("collection_auto_report", "true")
+        ).strip().lower()
+        self.auto_report_checkbox.setChecked(auto_report not in {"false", "0", "no", "off"})
+        # Every Mission Control run starts from a known, reproducible clear-day
+        # baseline. Restoring the last test (often fog or rain) made a fresh run
+        # appear to have the wrong default environment.
+        environment_widgets = (
+            (self.season_combo, "environment_season", "summer"),
+            (self.time_of_day_combo, "environment_time_of_day", "noon"),
+            (self.visibility_combo, "environment_visibility", "clear"),
+            (self.precipitation_combo, "environment_precipitation", "none"),
+        )
+        for combo, _key, default in environment_widgets:
+            index = combo.findData(default)
+            combo.setCurrentIndex(index if index >= 0 else combo.findData(default))
+        self.precipitation_intensity.setValue(0.6)
+        self.wind_north.setValue(0.0)
+        self.wind_east.setValue(0.0)
+        self._environment_state = self._selected_environment()
+        self._update_environment_input_state()
 
     def _save_settings(self) -> None:
         self.settings.setValue("takeoff_altitude", self.takeoff_altitude.value())
@@ -2750,10 +3229,15 @@ class MissionControlWindow(QMainWindow):
         self.settings.setValue("collection_rate_hz", self.collection_rate.value())
         for key, checkbox in self.collection_sensor_checks.items():
             self.settings.setValue(f"collection_sensor_{key}", checkbox.isChecked())
-
+        self.settings.setValue(
+            "collection_auto_report",
+            self.auto_report_checkbox.isChecked(),
+        )
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         self._save_settings()
         self.recorder.stop(timeout_seconds=5.0)
+        if self._report_worker is not None and self._report_worker.isRunning():
+            self._report_worker.wait(15000)
         self.worker.stop()
         self.worker.wait(2500)
         event.accept()

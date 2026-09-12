@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from data_collection.recorder import DataRecorder, RecordingConfig
+from data_collection.report import generate_session_report
 
 
 def _config(output_root: Path) -> RecordingConfig:
@@ -27,6 +28,13 @@ def _config(output_root: Path) -> RecordingConfig:
             "annotations",
         ),
         sample_rate_hz=2.0,
+        season="winter",
+        time_of_day="night",
+        visibility="fog",
+        precipitation="rain",
+        precipitation_intensity=0.7,
+        wind_north_mps=4.0,
+        wind_east_mps=-2.0,
     )
 
 
@@ -78,6 +86,11 @@ def test_recorder_writes_synchronized_frame(tmp_path: Path) -> None:
     assert session["status"] == "complete"
     assert session["written_frames"] == 1
     assert session["dropped_frames"] == 0
+    assert session["config"]["time_of_day"] == "night"
+    assert session["config"]["season"] == "winter"
+    assert session["config"]["visibility"] == "fog"
+    assert session["config"]["precipitation"] == "rain"
+    assert session["config"]["wind_north_mps"] == 4.0
 
 
 def test_paused_recorder_does_not_enqueue_frames(tmp_path: Path) -> None:
@@ -87,3 +100,68 @@ def test_paused_recorder_does_not_enqueue_frames(tmp_path: Path) -> None:
     assert not recorder.capture({"RGB": b"ignored"}, [], {})
     recorder.stop()
     assert recorder.stats()["written_frames"] == 0
+
+
+def test_report_writes_analysis_csv_and_pdf(tmp_path: Path) -> None:
+    recorder = DataRecorder(queue_capacity=4)
+    session_dir = recorder.start(_config(tmp_path))
+    for frame_id in range(2):
+        recorder.update_telemetry(
+            {
+                "x": float(frame_id * 3),
+                "y": 0.0,
+                "altitude": 5.0 + frame_id,
+                "speed": 3.0 + frame_id,
+                "vx": 3.0,
+                "vy": 0.0,
+                "vz": 0.0,
+            }
+        )
+        recorder.update_lidar(
+            np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+            {"timestamp": 100 + frame_id},
+        )
+        recorder.update_radar(
+            {
+                "timestamp": 100 + frame_id,
+                "points": np.asarray([[4.0, 5.0, 6.0]], dtype=np.float32),
+            }
+        )
+        assert recorder.capture(
+            {
+                "RGB": b"rgb",
+                "Depth": b"depth",
+                "Segmentation": b"segmentation",
+                "_camera_timestamps": {
+                    "RGB": 1_000_000_000 + frame_id,
+                    "Depth": 1_000_000_100 + frame_id,
+                },
+            },
+            [
+                {
+                    "name": "BP_AINormalPeople_1",
+                    "target_kind": "human",
+                    "distance_m": 12.0,
+                    "radar_confirmed": True,
+                    "lidar_visible": True,
+                    "x_min": 10,
+                    "y_min": 20,
+                    "x_max": 30,
+                    "y_max": 60,
+                }
+            ],
+            {"type": "central_patrol", "route_index": frame_id},
+        )
+    recorder.stop()
+
+    result = generate_session_report(session_dir)
+
+    assert result.pdf_path.read_bytes().startswith(b"%PDF")
+    assert result.frames_csv.exists()
+    assert result.objects_csv.exists()
+    assert result.summary_csv.exists()
+    assert result.summary["written_frames"] == 2
+    assert result.summary["detection_rows"] == 2
+    assert result.summary["class_counts"] == {"human": 2}
+    assert result.summary["time_of_day"] == "night"
+    assert result.summary["precipitation"] == "rain"

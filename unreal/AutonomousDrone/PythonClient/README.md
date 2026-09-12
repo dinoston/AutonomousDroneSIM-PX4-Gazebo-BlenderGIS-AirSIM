@@ -77,5 +77,35 @@ Depth, Segmentation 카메라 프레임을 기준으로 가장 가까운 LiDAR, 
 도시 간 비교에서는 `city`, `region`, `terrain_type`을 반드시 다르게 기록하고,
 동일한 `class_map.json`을 유지해야 클래스별 성능을 공정하게 비교할 수 있습니다.
 
+`수집 종료 후 요약·그래프 PDF 자동 생성`을 켜면 수집 종료 뒤 세션의
+`analysis` 폴더에 `frames.csv`, `objects.csv`, `session_summary.csv`와
+`session_report.pdf`가 생성됩니다. 기존 세션은 `기존 세션 폴더 분석` 버튼으로
+다시 분석할 수 있습니다. 보고서 생성은 별도 스레드에서 실행되어 비행 UI를
+멈추지 않습니다.
+
+## 환경·날씨 제어
+
+Mission Control의 `환경 · 날씨` 탭에서 봄/여름/가을/겨울, 아침/점심/저녁/한밤,
+맑음/흐림/안개, 강수 없음/비/눈을 선택할 수 있습니다. 강수 강도는 0~1이며, NED 기준
+북·동 방향의 물리 바람도 -30~30 m/s 범위에서 설정합니다. `환경 적용`을
+누르면 Cosys-AirSim 시간·날씨·바람 API로 전달되고, 재연결할 때 마지막
+선택값이 자동으로 다시 적용됩니다.
+
+Good SKY는 하늘·태양·구름의 시각 표현을 담당하고, 실제 비·눈·안개·바람
+시뮬레이션은 Cosys-AirSim이 담당합니다. 계절은 반복 가능한 태양 위치와
+데이터셋 메타데이터에 반영됩니다. 나무 잎이나 지면 재질까지 계절에 맞게
+바꾸려면 레벨의 식생/머티리얼용 계절 프리셋을 별도로 연결해야 합니다.
+
+`/Game/GoodSky/Blueprint/BP_GoodSky`가 설치되어 있으면 환경 적용 시
+`DroneEnv.ApplyGoodSky` 브리지가 런타임 하늘 액터를 자동 생성합니다. 따라서
+레벨에 BP_GoodSky를 직접 중복 배치할 필요가 없습니다. 맑음은 `Clear`, 흐림은
+`Super Heavy`, 안개는 `Middle`, 비·눈은 `Storm` 시각 프리셋을 사용하며 실제
+강수·안개·바람 물리는 계속 Cosys-AirSim이 담당합니다.
+
+실제로 적용된 환경값은 이후 데이터 수집 세션의 `session.json`,
+`session_summary.csv`, `session_report.pdf`에 자동 기록됩니다. `흐림`은
+현재 레벨에 Volumetric Cloud 액터가 있어야 구름이 보이며, 젖은 도로와
+도로 적설은 AirSim용 노면 머티리얼 설정이 필요합니다.
+
 원본 센서 파일과 함께 분석용 CSV를 저장하는 다음 단계의 구조와 개발 순서는
 [`docs/DATASET_CSV_PLAN.md`](docs/DATASET_CSV_PLAN.md)에 정리되어 있습니다.
