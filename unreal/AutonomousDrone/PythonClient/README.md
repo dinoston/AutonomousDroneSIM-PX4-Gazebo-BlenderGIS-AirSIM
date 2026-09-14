@@ -81,7 +81,8 @@ Depth, Segmentation 카메라 프레임을 기준으로 가장 가까운 LiDAR, 
 `analysis` 폴더에 `frames.csv`, `objects.csv`, `session_summary.csv`와
 `session_report.pdf`가 생성됩니다. 기존 세션은 `기존 세션 폴더 분석` 버튼으로
 다시 분석할 수 있습니다. 보고서 생성은 별도 스레드에서 실행되어 비행 UI를
-멈추지 않습니다.
+멈추지 않습니다. 수집 중 Mission Control 창을 바로 닫는 경우에도 원본 저장을
+마무리한 뒤 누락된 `analysis` 보고서를 생성하고 종료합니다.
 
 ## 환경·날씨 제어
 

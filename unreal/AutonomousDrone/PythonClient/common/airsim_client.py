@@ -16,6 +16,26 @@ from perception.segmentation_labels import configure_air_sim_segmentation
 from perception.target_detector import TargetDetector
 
 
+def navigation_tracking_limits(
+    requested_speed_mps: float,
+    waypoint_count: int,
+) -> tuple[float, float]:
+    """Return a safe path speed and lookahead for the planned geometry.
+
+    Two or more commanded points mean the route contains a detour or corner.
+    Capping that route at 10 m/s and keeping lookahead below 5 m prevents
+    AirSim from cutting across the inflated obstacle cells.
+    """
+    requested_speed = float(requested_speed_mps)
+    command_speed = (
+        min(requested_speed, 10.0)
+        if int(waypoint_count) >= 2
+        else requested_speed
+    )
+    lookahead_m = min(5.0, max(2.5, command_speed * 0.45))
+    return command_speed, lookahead_m
+
+
 class AirSimController:
     def __init__(
         self,
@@ -582,12 +602,14 @@ class AirSimController:
 
     def move_to(self, x_m: float, y_m: float, altitude_m: float, speed_mps: float) -> None:
         validate_destination(x_m, y_m, altitude_m, speed_mps)
-        lookahead_m = max(5.0, float(speed_mps) * 2.0)
-        self._require_client().moveToPositionAsync(
+        command_speed, lookahead_m = navigation_tracking_limits(speed_mps, 1)
+        client = self._require_client()
+        client.cancelLastTask(vehicle_name=self.vehicle_name)
+        client.moveToPositionAsync(
             float(x_m),
             float(y_m),
             altitude_to_ned_z(altitude_m),
-            float(speed_mps),
+            command_speed,
             drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=airsim.YawMode(False, 0),
             lookahead=lookahead_m,
@@ -654,16 +676,19 @@ class AirSimController:
             airsim.Vector3r(x, y, altitude_to_ned_z(altitude))
             for x, y, altitude in point_list
         ]
-        # The planner grid is 2.5 m. AirSim's automatic lookahead was only
-        # about 1.8 m at the normal mission speed, so the controller reacted
-        # to nearly every grid corner. Looking several metres ahead produces
-        # one continuous trajectory through the short A* segments.
-        # 경로계획 격자는 2.5m이지만 기본 선행거리는 약 1.8m여서 각 격자 모서리마다
-        # 제어가 반응했습니다. 선행거리를 늘려 짧은 A* 구간을 연속 경로로 추종합니다.
-        lookahead_m = max(5.0, float(speed_mps) * 2.0)
+        # A long speed-scaled lookahead reached 24 m at 12 m/s and cut a safe
+        # A* detour diagonally back through poles. Detours use a conservative
+        # speed and 2.5-5 m lookahead so the physical flight follows the map.
+        # 기존 속도 비례 선행거리는 12m/s에서 24m가 되어 안전한 A* 우회로를
+        # 대각선으로 잘라 전봇대 쪽으로 들어갔습니다. 우회 경로는 보수적인
+        # 속도와 2.5~5m 선행거리로 실제 비행이 지도 경로를 따르게 합니다.
+        command_speed, lookahead_m = navigation_tracking_limits(
+            speed_mps,
+            len(point_list),
+        )
         client.moveOnPathAsync(
             path,
-            float(speed_mps),
+            command_speed,
             # A multirotor can translate without continuously turning toward
             # every short A* segment. This prevents heading corrections from
             # producing visible left/right jitter.
@@ -685,7 +710,7 @@ class AirSimController:
         normal_z: float,
         altitude_m: float,
         escape_altitude_m: float,
-        retreat_distance_m: float = 4.5,
+        retreat_distance_m: float = 2.0,
     ) -> None:
         """Back away from a collision, then execute the replanned path.
 
@@ -723,7 +748,7 @@ class AirSimController:
                     "천장/바닥 충돌면에서 안전 고도로 벗어나지 못했습니다."
                 )
         else:
-            retreat_speed = 1.5
+            retreat_speed = 2.0
             retreat_duration = max(
                 0.5,
                 float(retreat_distance_m) / retreat_speed,

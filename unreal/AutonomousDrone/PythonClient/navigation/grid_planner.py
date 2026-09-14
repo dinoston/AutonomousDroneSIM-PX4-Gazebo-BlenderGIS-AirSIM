@@ -253,11 +253,19 @@ class AltitudeGridPlanner:
             1,
             int(ceil(self.config.drone_radius_m / self.config.resolution_m)),
         )
-        blocked = {
+        start_footprint = {
             cell
             for cell in blocked
-            if hypot(cell[0] - start[0], cell[1] - start[1]) > start_clearance
+            if hypot(cell[0] - start[0], cell[1] - start[1]) <= start_clearance
         }
+        # Clear a dense ring that is characteristic of vehicle-body/self
+        # reflection, but keep one or two genuine cells such as a nearby pole
+        # or blocked diagonal corner. Unconditionally clearing the full radius
+        # made planned paths cut through lamps directly in front of the drone.
+        # 시작점 주변이 조밀한 링일 때만 자체 반사로 보고 비웁니다. 한두 셀의
+        # 가로등·모서리는 실제 장애물로 유지하여 경로가 관통하지 않게 합니다.
+        if len(start_footprint) >= 6:
+            blocked = blocked - start_footprint
         blocked.discard(goal)
         frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
         came_from: dict[tuple[int, int], tuple[int, int]] = {}
@@ -285,13 +293,28 @@ class AltitudeGridPlanner:
                     or (current[0], current[1] + dy) in blocked
                 ):
                     continue
-                new_cost = cost[current] + step
+                current_goal_distance = hypot(
+                    goal[0] - current[0],
+                    goal[1] - current[1],
+                )
+                next_goal_distance = hypot(goal[0] - nxt[0], goal[1] - nxt[1])
+                # A mathematically short detour can begin with a visible
+                # reverse move when a coarse inflated obstacle sits in front
+                # of the start cell. Strongly prefer side/forward cells and
+                # keep reverse travel only as a last-resort escape route.
+                # 거친 안전 격자에서 전방 장애물을 만났을 때 최단경로가 먼저
+                # 뒤로 빠지는 현상을 억제합니다. 옆/앞 진행을 우선하고 후진은
+                # 정말 다른 통로가 없을 때만 선택합니다.
+                reverse_penalty = max(
+                    0.0,
+                    next_goal_distance - current_goal_distance,
+                ) * 4.0
+                new_cost = cost[current] + step + reverse_penalty
                 if new_cost >= cost.get(nxt, float("inf")):
                     continue
                 cost[nxt] = new_cost
                 came_from[nxt] = current
-                heuristic = hypot(goal[0] - nxt[0], goal[1] - nxt[1])
-                heapq.heappush(frontier, (new_cost + heuristic, nxt))
+                heapq.heappush(frontier, (new_cost + next_goal_distance, nxt))
         return []
 
     def _simplify(

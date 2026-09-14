@@ -415,7 +415,8 @@ class MissionControlWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(
-            "Autonomous Drone Mission Control · Semantic/Data v1 · Avoidance v9"
+            "Autonomous Drone Mission Control · Semantic/Data v1 · "
+            "Avoidance v13 Forward Advance"
         )
         self.resize(1500, 920)
         self.settings = QSettings("AutonomousDrone", "MissionControl")
@@ -436,22 +437,19 @@ class MissionControlWindow(QMainWindow):
             "wind_north_mps": 0.0,
             "wind_east_mps": 0.0,
         }
-        # The AirBase capture covers 1400 m. A 2.5 m planning grid keeps
-        # full-map A* practical while retaining useful obstacle clearance.
-        # AirBase 캡처 범위는 1400m이며, 2.5m 격자를 사용해 전체 지도 A*의
-        # 계산량을 줄이면서 필요한 장애물 안전거리를 유지합니다.
+        # Forward Flow uses a coarse grid and a broad vehicle envelope. This
+        # produces a few large-direction detours instead of many tiny steering
+        # corrections around every return in the industrial scene.
+        # Forward Flow는 거친 격자와 넓은 기체 안전영역을 사용합니다. 산업
+        # 지형의 반사점마다 미세 조향하지 않고 몇 개의 큰 방향으로 우회합니다.
         self.planner = AltitudeGridPlanner(
             PlannerConfig(
                 half_extent_m=900.0,
-                resolution_m=2.5,
-                drone_radius_m=2.5,
-                vertical_clearance_m=1.5,
-                # LiDAR may select a higher layer in 2 m steps. The 8 m limit
-                # allows a gentle climb without permitting an excessive escape.
-                # LiDAR가 2m 간격의 상위 고도층을 선택할 수 있습니다. 최대 8m로
-                # 제한하여 과도하게 상승하지 않고 완만하게 장애물을 넘습니다.
-                altitude_step_m=2.0,
-                max_extra_altitude_m=8.0,
+                resolution_m=4.0,
+                drone_radius_m=4.0,
+                vertical_clearance_m=2.0,
+                altitude_step_m=4.0,
+                max_extra_altitude_m=12.0,
             )
         )
         self._telemetry: dict | None = None
@@ -476,6 +474,9 @@ class MissionControlWindow(QMainWindow):
         self._mission_stall_started = 0.0
         self._last_stall_recovery = 0.0
         self._obstacle_detection_count = 0
+        self._last_obstacle_hit_xy: tuple[float, float] | None = None
+        self._last_avoided_obstacle_xy: tuple[float, float] | None = None
+        self._last_avoided_obstacle_until = 0.0
         self._avoidance_grace_until = 0.0
         self._last_collision_timestamp = 0.0
         self._avoidance_altitude_floor_m = 1.0
@@ -1526,6 +1527,40 @@ class MissionControlWindow(QMainWindow):
                 f"고도 {approach_altitude:.1f}m까지 1.5m/s로 접근한 뒤 착륙합니다."
             )
 
+    def _safe_altitude_at_xy(
+        self,
+        x_m: float,
+        y_m: float,
+        requested_altitude_m: float,
+        current_altitude_m: float,
+    ) -> tuple[float, float | None]:
+        """Limit a descent so the vehicle keeps clearance above a surface."""
+        points = self._combined_obstacle_points()
+        if not points.size:
+            return float(requested_altitude_m), None
+        horizontal = np.hypot(points[:, 0] - x_m, points[:, 1] - y_m)
+        obstacle_altitudes = -points[:, 2]
+        vertical_footprint = max(
+            1.5,
+            min(2.5, self.planner.config.drone_radius_m),
+        )
+        underneath = (
+            (horizontal <= vertical_footprint)
+            & (obstacle_altitudes <= current_altitude_m + 0.5)
+            & (obstacle_altitudes >= -1.0)
+        )
+        if not np.any(underneath):
+            return float(requested_altitude_m), None
+        surface_altitude = float(np.max(obstacle_altitudes[underneath]))
+        if requested_altitude_m >= current_altitude_m:
+            return float(requested_altitude_m), surface_altitude
+        clearance = self.planner.config.vertical_clearance_m + 0.75
+        safe_altitude = max(
+            float(requested_altitude_m),
+            surface_altitude + clearance,
+        )
+        return min(float(current_altitude_m), safe_altitude), surface_altitude
+
     def _emergency_stop(self) -> None:
         self._clear_active_mission_state()
         self.worker.discard_pending_navigation()
@@ -1880,6 +1915,8 @@ class MissionControlWindow(QMainWindow):
                 (0, 3),
                 dtype=np.float32,
             )
+            self._last_avoided_obstacle_xy = None
+            self._last_avoided_obstacle_until = 0.0
         target = target_override or (
             self._active_target
             if replan and self._active_target is not None
@@ -2116,9 +2153,12 @@ class MissionControlWindow(QMainWindow):
         if self._mission_stall_started <= 0.0:
             self._mission_stall_started = now
             return
-        if now - self._mission_stall_started < 2.5:
+        # Forward Flow confirms a silent hover quickly so an expired AirSim
+        # command does not leave the vehicle waiting in the middle of a route.
+        # AirSim 명령 만료로 중간 호버링에 머무르지 않도록 짧게 확인합니다.
+        if now - self._mission_stall_started < 0.9:
             return
-        if now - self._last_stall_recovery < 4.0:
+        if now - self._last_stall_recovery < 2.0:
             return
 
         self._last_stall_recovery = now
@@ -2126,7 +2166,7 @@ class MissionControlWindow(QMainWindow):
         try:
             self.worker.discard_pending_navigation()
             self._plan_and_fly(replan=True, reset_avoidance=False)
-            self._avoidance_grace_until = now + 2.0
+            self._avoidance_grace_until = now + 0.65
             self.message_label.setText(
                 f"비행 정지 감지 · 남은 거리 {remaining_xy:.1f}m · "
                 "안전 경로를 자동 재전송했습니다."
@@ -2145,25 +2185,15 @@ class MissionControlWindow(QMainWindow):
 
         기체 바로 아래 표면과 안전거리를 확보하는 최종 하강 고도를 반환합니다.
         """
-        points = self._combined_obstacle_points()
-        if not points.size:
-            return float(requested_altitude_m), None
         target_x = float(self._active_target[0]) if self._active_target else float(data["x"])
         target_y = float(self._active_target[1]) if self._active_target else float(data["y"])
-        horizontal = np.hypot(points[:, 0] - target_x, points[:, 1] - target_y)
-        obstacle_altitudes = -points[:, 2]
         current_altitude = float(data["altitude"])
-        underneath = (
-            (horizontal <= self.planner.config.drone_radius_m + 0.75)
-            & (obstacle_altitudes <= current_altitude + 0.5)
-            & (obstacle_altitudes >= -1.0)
+        return self._safe_altitude_at_xy(
+            target_x,
+            target_y,
+            requested_altitude_m,
+            current_altitude,
         )
-        if not np.any(underneath):
-            return float(requested_altitude_m), None
-        surface_altitude = float(np.max(obstacle_altitudes[underneath]))
-        clearance = self.planner.config.vertical_clearance_m + 0.75
-        safe_altitude = max(float(requested_altitude_m), surface_altitude + clearance)
-        return min(current_altitude, safe_altitude), surface_altitude
 
     def _advance_terminal_descent(self, data: dict) -> None:
         """Descend only after reaching the target XY and checking below.
@@ -2385,7 +2415,7 @@ class MissionControlWindow(QMainWindow):
             # starting the replacement route.
             # 새 경로를 시작하기 전에 경로계획기의 2.5m 안전 팽창 반경 밖으로
             # 충분히 후퇴합니다.
-            retreat_distance = 4.5
+            retreat_distance = 2.0
             current_altitude = float(data["altitude"])
             if vertical_collision:
                 retreat_start = (float(data["x"]), float(data["y"]))
@@ -2420,10 +2450,10 @@ class MissionControlWindow(QMainWindow):
                 )
                 escape_altitude = current_altitude
             self._last_replan = time.monotonic()
-            # Plan from the expected retreat point. The worker physically backs
-            # away first, climbs in place, and only then starts horizontal flight.
-            # 예상 후퇴 지점에서 경로를 계산합니다. 작업 스레드는 실제로 먼저
-            # 후퇴하고 제자리 상승을 마친 뒤에만 수평 비행을 시작합니다.
+            # A real contact receives only the short release distance needed
+            # to leave the collision solver, then immediately resumes the route.
+            # 실제 접촉 때만 충돌 솔버에서 빠져나올 최소 거리만 이동한 뒤
+            # 곧바로 우회 경로를 계속합니다.
             self._plan_and_fly(
                 replan=True,
                 start_override=retreat_start,
@@ -2628,7 +2658,7 @@ class MissionControlWindow(QMainWindow):
             if distance <= emergency_distance:
                 self.worker.submit("emergency", priority=0)
             self._plan_and_fly(replan=True)
-            self._avoidance_grace_until = now + 2.0
+            self._avoidance_grace_until = now + 0.75
             self.message_label.setText(
                 f"적 드론 {distance:.1f}m 전방 감지 · 동적 회피 경로 생성"
             )
@@ -2829,7 +2859,7 @@ class MissionControlWindow(QMainWindow):
         # 8m/s에서는 약 40m 전방을 검사합니다. 기존 3초 유예는 재검사 전에
         # 최대 24m를 진행하게 만들어 벽에 닿을 수 있었습니다.
         detection_distance = max(15.0, horizontal_speed * 4.0 + 8.0)
-        corridor_half_width = self.planner.config.drone_radius_m + 0.75
+        corridor_half_width = self.planner.config.drone_radius_m + 1.0
         mask = (
             (forward >= 0.5)
             & (forward <= detection_distance)
@@ -2844,34 +2874,61 @@ class MissionControlWindow(QMainWindow):
         candidates = np.flatnonzero(mask)
         candidates = candidates[np.argsort(forward[candidates])]
         nearest_index: int | None = None
-        # Reject isolated rays. A real wall/large obstacle produces a compact
-        # group of returns; one or two points are commonly vegetation edges,
-        # particles, or residual self-reflections.
-        # 실제 벽은 가까운 반사점 묶음을 만들지만 1~2개 점은 식생 가장자리,
-        # 파티클 또는 기체 잔여 반사일 가능성이 높으므로 장애물로 확정하지 않습니다.
+        # Walls are accepted from a compact three-point cluster. A pole may
+        # produce only one return, so also accept a sparse hit when it is close
+        # and inside the vehicle's exact flight footprint; temporal confirmation
+        # in _on_lidar still rejects a one-frame particle or self-reflection.
+        # 벽은 3점 군집으로 확인합니다. 전봇대는 한 점만 반사할 수 있으므로
+        # 가까우면서 기체의 실제 진행 폭 안에 든 희소점도 후보로 받되,
+        # _on_lidar의 연속 프레임 검증으로 순간 파티클과 자체 반사는 거릅니다.
+        sparse_guard_distance = max(6.0, horizontal_speed * 1.1 + 3.0)
         for candidate in candidates[:96]:
             neighborhood = mask & (
                 (np.abs(forward - forward[candidate]) <= 1.75)
                 & (np.abs(signed_lateral - signed_lateral[candidate]) <= 1.5)
                 & (np.abs(world[:, 2] - world[candidate, 2]) <= 1.5)
             )
-            if int(np.count_nonzero(neighborhood)) >= 4:
+            support_count = int(np.count_nonzero(neighborhood))
+            dense_obstacle = support_count >= 3
+            close_thin_obstacle = (
+                support_count >= 1
+                and float(forward[candidate]) <= sparse_guard_distance
+                and float(lateral[candidate])
+                <= self.planner.config.drone_radius_m + 0.25
+            )
+            if dense_obstacle or close_thin_obstacle:
                 nearest_index = int(candidate)
                 break
         if nearest_index is None:
             return None
         nearest_distance = float(forward[nearest_index])
-        # Estimate the visible facade width from returns near the first hit,
-        # then add clearance for sparse scans and the vehicle body.
-        # 최초 반사점 주변 점으로 보이는 외벽 폭을 추정하고 희소한 스캔과
-        # 기체 크기를 고려한 여유 폭을 더합니다.
+        # Measure width relative to the first hit. Absolute lateral distance
+        # made a roadside lamp look like a wide wall simply because the lamp
+        # was offset from the path centre. The planner adds the vehicle safety
+        # radius later, so a pole needs only a compact 0.75 m marker here.
+        # 최초 반사점 기준으로 폭을 계산합니다. 기존 절대 횡거리는 경로 중심에서
+        # 떨어진 가로등을 넓은 벽으로 오판했습니다. 기체 안전반경은 A*가 별도로
+        # 더하므로 전봇대 자체는 0.75m의 작은 장애물로만 등록합니다.
         wall_band = mask & (forward <= nearest_distance + 6.0)
-        visible_half_span = (
-            float(np.percentile(lateral[wall_band], 90))
+        visible_half_width = (
+            float(
+                np.percentile(
+                    np.abs(
+                        signed_lateral[wall_band]
+                        - signed_lateral[nearest_index]
+                    ),
+                    90,
+                )
+            )
             if np.any(wall_band)
             else 0.0
         )
-        barrier_half_span = min(25.0, max(6.0, visible_half_span + 4.0))
+        thin_obstacle = visible_half_width < 1.0
+        barrier_half_span = (
+            min(2.0, max(0.75, visible_half_width + 0.5))
+            if thin_obstacle
+            else min(25.0, max(3.0, visible_half_width + 2.0))
+        )
         hit = tuple(float(value) for value in world[nearest_index])
         return (
             nearest_distance,
@@ -2886,9 +2943,9 @@ class MissionControlWindow(QMainWindow):
         travel_direction_xy: tuple[float, float],
         half_span_m: float,
     ) -> int:
-        """Persist a detected facade across all usable flight layers.
+        """Persist a detected facade or rooftop with suitable geometry.
 
-        감지한 외벽을 현재 임무의 모든 사용 가능 고도층에 보존합니다.
+        외벽은 수직 장벽으로, 평평한 지붕은 수평 면으로 보존합니다.
         """
         requested_altitude = (
             float(self._active_target[2])
@@ -2898,13 +2955,56 @@ class MissionControlWindow(QMainWindow):
         maximum_altitude = requested_altitude + self.planner.config.max_extra_altitude_m
         if self._avoidance_altitude_ceiling_m is not None:
             maximum_altitude = min(maximum_altitude, self._avoidance_altitude_ceiling_m)
-        barrier = build_vertical_barrier(
-            hit_xyz,
-            travel_direction_xy,
-            half_span_m,
-            self._avoidance_altitude_floor_m,
-            max(self._avoidance_altitude_floor_m, maximum_altitude),
+        hit_x, hit_y, hit_z = map(float, hit_xyz)
+        vehicle_z = (
+            -float(self._telemetry["altitude"])
+            if self._telemetry is not None
+            else hit_z
         )
+        lidar = self._latest_lidar_world
+        local_surface = np.empty((0, 3), dtype=np.float32)
+        if lidar.size:
+            local_distance = np.hypot(lidar[:, 0] - hit_x, lidar[:, 1] - hit_y)
+            local_surface = lidar[local_distance <= max(3.0, min(8.0, half_span_m))]
+        surface_height_span = (
+            float(np.ptp(local_surface[:, 2]))
+            if len(local_surface) >= 3
+            else float("inf")
+        )
+        # A roof close below the drone used to be extruded into an infinitely
+        # tall facade. That removed the valid climb-over route and caused
+        # stop/reverse cycles. Flat returns below the vehicle are instead kept
+        # as a horizontal patch, allowing the planner to climb over them.
+        # 드론 아래의 평평한 지붕을 수직 외벽으로 늘리지 않습니다. 지붕은
+        # 수평 면으로 저장하여 위쪽의 유효한 통과 경로를 남깁니다.
+        horizontal_surface = (
+            hit_z - vehicle_z >= 0.4
+            and surface_height_span <= 1.25
+        )
+        if horizontal_surface:
+            patch_radius = min(20.0, max(6.0, float(half_span_m) + 4.0))
+            offsets = np.arange(
+                -patch_radius,
+                patch_radius + 1.0,
+                2.0,
+                dtype=np.float32,
+            )
+            patch_x, patch_y = np.meshgrid(offsets, offsets)
+            barrier = np.column_stack(
+                (
+                    hit_x + patch_x.ravel(),
+                    hit_y + patch_y.ravel(),
+                    np.full(patch_x.size, hit_z, dtype=np.float32),
+                )
+            )
+        else:
+            barrier = build_vertical_barrier(
+                hit_xyz,
+                travel_direction_xy,
+                half_span_m,
+                self._avoidance_altitude_floor_m,
+                max(self._avoidance_altitude_floor_m, maximum_altitude),
+            )
         previous_count = len(self._collision_obstacle_points)
         if self._collision_obstacle_points.size:
             self._collision_obstacle_points = np.vstack(
@@ -2914,6 +3014,122 @@ class MissionControlWindow(QMainWindow):
             self._collision_obstacle_points = barrier
         self._refresh_obstacle_map()
         return previous_count
+
+    def _is_known_avoidance_surface(
+        self,
+        hit_xyz: tuple[float, float, float],
+    ) -> bool:
+        """Return whether a LiDAR hit already belongs to the active detour."""
+        if not self._collision_obstacle_points.size:
+            return False
+        hit = np.asarray(hit_xyz, dtype=np.float32)
+        delta = self._collision_obstacle_points - hit
+        horizontal = np.hypot(delta[:, 0], delta[:, 1])
+        vertical = np.abs(delta[:, 2])
+        match_distance = max(2.0, self.planner.config.resolution_m * 0.75)
+        return bool(
+            np.any(
+                (horizontal <= match_distance)
+                & (vertical <= self.planner.config.vertical_clearance_m + 0.75)
+            )
+        )
+
+    def _command_forward_bypass(
+        self,
+        obstacle_distance_m: float,
+        travel_direction_xy: tuple[float, float],
+        half_span_m: float,
+    ) -> None:
+        """Send a coarse forward/side bypass when the local A* map is sealed."""
+        if self._telemetry is None or self._active_target is None:
+            raise RuntimeError("전진 우회에 필요한 현재 위치 또는 목적지가 없습니다.")
+        direction = np.asarray(travel_direction_xy, dtype=np.float64)
+        direction /= max(float(np.linalg.norm(direction)), 1e-9)
+        tangent = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+        current = np.asarray(
+            [float(self._telemetry["x"]), float(self._telemetry["y"])],
+            dtype=np.float64,
+        )
+        target = np.asarray(self._active_target[:2], dtype=np.float64)
+        target_forward = float(np.dot(target - current, direction))
+        if target_forward <= 1.0:
+            raise RuntimeError("목적지가 현재 진행 방향 뒤에 있어 전진 우회를 만들 수 없습니다.")
+
+        lateral_offset = min(
+            34.0,
+            max(
+                8.0,
+                float(half_span_m) + self.planner.config.drone_radius_m + 4.0,
+            ),
+        )
+        forward_clear = max(12.0, float(obstacle_distance_m) + 10.0)
+        forward_clear = min(
+            forward_clear,
+            max(float(obstacle_distance_m) + 4.0, target_forward - 2.0),
+        )
+        turn_forward = min(
+            max(2.0, float(obstacle_distance_m) * 0.4),
+            max(2.0, forward_clear * 0.45),
+        )
+
+        cloud = self._latest_lidar_world
+        side_scores: dict[float, int] = {-1.0: 0, 1.0: 0}
+        if cloud.size:
+            relative = cloud[:, :2] - current
+            cloud_forward = relative @ direction
+            cloud_lateral = relative @ tangent
+            cloud_vertical = np.abs(
+                cloud[:, 2] + float(self._telemetry["altitude"])
+            )
+            relevant = (
+                (cloud_forward >= 0.0)
+                & (cloud_forward <= forward_clear + 5.0)
+                & (
+                    cloud_vertical
+                    <= self.planner.config.vertical_clearance_m + 1.0
+                )
+            )
+            side_band = self.planner.config.drone_radius_m + 3.0
+            for sign in (-1.0, 1.0):
+                side_scores[sign] = int(
+                    np.count_nonzero(
+                        relevant
+                        & (
+                            np.abs(cloud_lateral - sign * lateral_offset)
+                            <= side_band
+                        )
+                    )
+                )
+        goal_side = float(np.dot(target - current, tangent))
+        preferred_sign = 1.0 if goal_side >= 0.0 else -1.0
+        side_sign = min(
+            (-1.0, 1.0),
+            key=lambda sign: (side_scores[sign], sign != preferred_sign),
+        )
+
+        cruise_altitude = max(
+            float(self._telemetry["altitude"]),
+            float(self._active_target[2]),
+        )
+        side_vector = tangent * side_sign * lateral_offset
+        first = current + direction * turn_forward + side_vector
+        second = current + direction * forward_clear + side_vector
+        bypass_path = [
+            (float(first[0]), float(first[1]), cruise_altitude),
+            (float(second[0]), float(second[1]), cruise_altitude),
+            (float(target[0]), float(target[1]), cruise_altitude),
+        ]
+        self._pending_descent_altitude = (
+            float(self._active_target[2])
+            if cruise_altitude > float(self._active_target[2]) + 0.25
+            else None
+        )
+        self._pending_descent_safe_altitude = None
+        self._pending_descent_commanded = False
+        self._planned_path = bypass_path
+        self._mission_stall_started = 0.0
+        self.minimap.set_path(bypass_path)
+        self.worker.submit("path", bypass_path, self.speed.value(), priority=1)
 
     def _rollback_detected_wall(self, previous_count: int) -> None:
         """Remove the most recent speculative LiDAR wall after a failed plan."""
@@ -2934,6 +3150,7 @@ class MissionControlWindow(QMainWindow):
         if not points.size:
             self._latest_lidar_world = np.empty((0, 3), dtype=np.float32)
             self._obstacle_detection_count = 0
+            self._last_obstacle_hit_xy = None
             self.telemetry_labels["lidar"].setText("반사점 없음")
             self._refresh_obstacle_map()
             return
@@ -2946,6 +3163,7 @@ class MissionControlWindow(QMainWindow):
         if not local.size:
             self._latest_lidar_world = np.empty((0, 3), dtype=np.float32)
             self._obstacle_detection_count = 0
+            self._last_obstacle_hit_xy = None
             self.telemetry_labels["lidar"].setText("유효 반사점 없음")
             self._refresh_obstacle_map()
             return
@@ -2973,22 +3191,82 @@ class MissionControlWindow(QMainWindow):
         if not self._active_target:
             return
         now = time.monotonic()
-        if now < self._avoidance_grace_until:
-            self._obstacle_detection_count = 0
-            return
 
         if obstacle_ahead is not None:
             obstacle_distance, hit_xyz, travel_direction, barrier_half_span = obstacle_ahead
-            self._obstacle_detection_count += 1
-            speed = 0.0 if self._telemetry is None else float(self._telemetry["speed"])
-            escape_distance = max(7.0, speed * 1.25 + 3.0)
+            # Forward Advance plans early but does not insert a hover merely
+            # because a wall entered a speed-scaled braking envelope. Only an
+            # immediately imminent contact may brake; ordinary poles, lamps,
+            # roofs and facades receive a moving replacement path.
+            # 장애물이 제동거리 안에 들어왔다는 이유만으로 호버링하지 않습니다.
+            # 실제 접촉 직전만 제동하고 나머지는 이동 중 경로를 교체합니다.
+            imminent_distance = 1.25
 
-            # Require a short three-frame confirmation in addition to the
-            # four-point spatial cluster above. At normal sensor rates this is
-            # still early enough for the 15-40 m preview corridor.
-            # 위의 4점 공간 군집에 더해 3프레임 연속 확인합니다. 일반 센서
-            # 주기에서는 15~40m 사전 탐지 범위 안에서 충분히 빠르게 반응합니다.
-            if self._obstacle_detection_count < 3:
+            if (
+                self._is_known_avoidance_surface(hit_xyz)
+                and obstacle_distance > imminent_distance
+            ):
+                self._obstacle_detection_count = 0
+                self._last_obstacle_hit_xy = None
+                self.telemetry_labels["lidar"].setText(
+                    f"{len(local):,} points · 등록된 장애물 우회 계속"
+                )
+                return
+
+            # Do not repeatedly react to the same object while the newly
+            # commanded broad detour is being followed. Collision telemetry
+            # remains active, and a genuinely imminent hit bypasses this lock.
+            # 새 대회피 경로를 따르는 동안 같은 물체에 반복 반응하지 않습니다.
+            # 충돌 텔레메트리는 계속 켜 두며 실제 근접점은 이 잠금을 무시합니다.
+            repeated_avoided_obstacle = (
+                self._last_avoided_obstacle_xy is not None
+                and now < self._last_avoided_obstacle_until
+                and math.hypot(
+                    float(hit_xyz[0]) - self._last_avoided_obstacle_xy[0],
+                    float(hit_xyz[1]) - self._last_avoided_obstacle_xy[1],
+                )
+                <= 6.0
+            )
+            if repeated_avoided_obstacle and obstacle_distance > imminent_distance:
+                self._obstacle_detection_count = 0
+                self._last_obstacle_hit_xy = None
+                self.telemetry_labels["lidar"].setText(
+                    f"{len(local):,} points · 같은 장애물 대회피 진행 중"
+                )
+                return
+
+            # A replan grace period may suppress a distant return while the
+            # vehicle turns, but it must never make close-range LiDAR blind.
+            # 재탐색 직후 먼 반사점은 잠시 무시할 수 있지만, 가까운 장애물까지
+            # 감지를 끄면 고속 비행 중 그대로 충돌하므로 근접점은 즉시 처리합니다.
+            if (
+                now < self._avoidance_grace_until
+                and obstacle_distance > imminent_distance
+            ):
+                self._obstacle_detection_count = 0
+                self._last_obstacle_hit_xy = None
+                return
+
+            # Count only detections that stay on the same world-space object.
+            # This keeps two-frame pole detection responsive without allowing
+            # unrelated sparse returns on alternating sides to accumulate.
+            # 같은 월드 위치에서 반복된 반사만 연속 감지로 셉니다. 따라서
+            # 전봇대에는 빠르게 반응하면서 서로 다른 희소점 누적 오탐은 막습니다.
+            hit_xy = (float(hit_xyz[0]), float(hit_xyz[1]))
+            same_obstacle = (
+                self._last_obstacle_hit_xy is not None
+                and math.hypot(
+                    hit_xy[0] - self._last_obstacle_hit_xy[0],
+                    hit_xy[1] - self._last_obstacle_hit_xy[1],
+                )
+                <= 4.0
+            )
+            self._obstacle_detection_count = (
+                self._obstacle_detection_count + 1 if same_obstacle else 1
+            )
+            self._last_obstacle_hit_xy = hit_xy
+            required_frames = 1 if obstacle_distance <= imminent_distance else 2
+            if self._obstacle_detection_count < required_frames:
                 return
 
             if not self.auto_replan_checkbox.isChecked():
@@ -3002,9 +3280,10 @@ class MissionControlWindow(QMainWindow):
                 )
                 return
 
-            if now - self._last_replan > 0.75:
+            if now - self._last_replan > 1.25:
                 self._last_replan = now
                 self._obstacle_detection_count = 0
+                self._last_obstacle_hit_xy = None
                 previous_wall_count = len(self._collision_obstacle_points)
                 try:
                     previous_wall_count = self._remember_detected_wall(
@@ -3012,55 +3291,30 @@ class MissionControlWindow(QMainWindow):
                         travel_direction,
                         barrier_half_span,
                     )
-                    close_escape = (
-                        obstacle_distance <= escape_distance
-                        and self._telemetry is not None
-                    )
-                    if close_escape:
-                        # Only a genuinely close obstacle needs braking and a
-                        # short reverse escape. Far detections stay in motion.
-                        # 정말 가까운 장애물에서만 제동 후 짧게 후퇴합니다.
-                        # 멀리서 감지한 경우에는 이동을 유지한 채 경로만 바꿉니다.
+                    must_brake = obstacle_distance <= imminent_distance
+                    if must_brake:
                         self._last_emergency_stop = now
                         self.worker.submit("emergency", priority=0)
-                        # If already close, back away before following the new
-                        # side route. This is proactive escape, not collision recovery.
-                        # 이미 가까우면 새 측면 경로를 따르기 전에 먼저 후퇴합니다.
-                        # 실제 충돌 후 복구가 아니라 충돌 전 선제 회피입니다.
-                        retreat_distance = 4.5
-                        retreat_start = (
-                            float(self._telemetry["x"]) - travel_direction[0] * retreat_distance,
-                            float(self._telemetry["y"]) - travel_direction[1] * retreat_distance,
-                        )
-                        current_altitude = float(self._telemetry["altitude"])
-                        self._plan_and_fly(
-                            replan=True,
-                            start_override=retreat_start,
-                            altitude_override=current_altitude,
-                            collision_escape=(
-                                -travel_direction[0],
-                                -travel_direction[1],
-                                0.0,
-                                current_altitude,
-                                current_altitude,
-                            ),
-                        )
-                    else:
-                        # moveOnPathAsync replaces the old straight path with
-                        # the detour without inserting a hover command.
-                        # hover 명령을 끼우지 않고 기존 직선 경로를 우회 경로로
-                        # 교체하여 비행을 계속합니다.
-                        self._plan_and_fly(replan=True)
-                    # Give the first lateral waypoint time to establish motion.
-                    # During this lock the new path is not cancelled by the
-                    # vehicle's remaining forward inertia.
-                    # 첫 측면 웨이포인트로 이동할 시간을 주어 남아 있는 전진
-                    # 관성이 새 우회 경로를 취소하지 않게 합니다.
+                    # Replace the path from the current position. Proactive
+                    # reverse motion is deliberately forbidden; a real contact
+                    # still has a short collision-release move as a last resort.
+                    # 현재 위치에서 경로를 바로 교체하며 충돌 전 선제 후퇴는 하지
+                    # 않습니다. 실제 충돌 때만 짧은 접촉 해제 이동을 허용합니다.
+                    self._plan_and_fly(replan=True)
+                    # Give the lateral command a brief settling window. Close
+                    # obstacles still bypass this guard above.
+                    # 측면 명령이 잡힐 짧은 시간만 두며, 근접 장애물은 위에서
+                    # 이 유예를 무시하고 즉시 처리합니다.
                     self._avoidance_grace_until = time.monotonic() + 2.0
+                    self._last_avoided_obstacle_xy = (
+                        float(hit_xyz[0]),
+                        float(hit_xyz[1]),
+                    )
+                    self._last_avoided_obstacle_until = time.monotonic() + 12.0
                     avoidance_mode = (
-                        "안전 후퇴 후 우회"
-                        if close_escape
-                        else "이동 유지하며 우회"
+                        "접촉 직전 짧게 제동 후 전진 우회"
+                        if must_brake
+                        else "멈춤·후진 없이 큰 방향으로 우회"
                     )
                     self.message_label.setText(
                         f"전방 {obstacle_distance:.1f}m 벽 사전 감지 · {avoidance_mode}"
@@ -3079,29 +3333,55 @@ class MissionControlWindow(QMainWindow):
                         narrow_wall_count = self._remember_detected_wall(
                             hit_xyz,
                             travel_direction,
-                            max(4.0, barrier_half_span * 0.55),
+                            max(0.5, barrier_half_span * 0.55),
                         )
                         self._plan_and_fly(replan=True)
                         self._avoidance_grace_until = time.monotonic() + 2.0
+                        self._last_avoided_obstacle_xy = (
+                            float(hit_xyz[0]),
+                            float(hit_xyz[1]),
+                        )
+                        self._last_avoided_obstacle_until = time.monotonic() + 12.0
                         self.message_label.setText(
-                            f"전방 {obstacle_distance:.1f}m 장애물 · 좁은 측면 우회로 계속 진행"
+                            f"전방 {obstacle_distance:.1f}m 장애물 · 대체 대회피 경로로 계속 진행"
                         )
                     except Exception as narrow_exc:
                         self._rollback_detected_wall(narrow_wall_count)
-                        if obstacle_distance <= escape_distance:
+                        if obstacle_distance <= imminent_distance:
                             self.worker.submit("emergency", priority=0)
                             self.message_label.setText(
                                 f"전방 {obstacle_distance:.1f}m 근접 장애물 · "
                                 f"안전 경로 재확인 중 ({narrow_exc})"
                             )
                         else:
-                            self._avoidance_grace_until = time.monotonic() + 1.5
-                            self.message_label.setText(
-                                f"전방 {obstacle_distance:.1f}m 희소 반사 제외 · 기존 경로 계속 진행"
-                            )
+                            try:
+                                self._command_forward_bypass(
+                                    obstacle_distance,
+                                    travel_direction,
+                                    barrier_half_span,
+                                )
+                                self._avoidance_grace_until = time.monotonic() + 2.5
+                                self._last_avoided_obstacle_xy = (
+                                    float(hit_xyz[0]),
+                                    float(hit_xyz[1]),
+                                )
+                                self._last_avoided_obstacle_until = (
+                                    time.monotonic() + 12.0
+                                )
+                                self.message_label.setText(
+                                    f"전방 {obstacle_distance:.1f}m · "
+                                    "A* 폐쇄 구간을 큰 전진 우회로 통과"
+                                )
+                            except Exception as bypass_exc:
+                                self._avoidance_grace_until = time.monotonic() + 0.5
+                                self.message_label.setText(
+                                    f"전방 {obstacle_distance:.1f}m · "
+                                    f"기존 진행 유지 ({bypass_exc})"
+                                )
                 return
         else:
             self._obstacle_detection_count = 0
+            self._last_obstacle_hit_xy = None
 
     def _on_command_completed(self, command: str) -> None:
         if command == "takeoff":
@@ -3238,6 +3518,28 @@ class MissionControlWindow(QMainWindow):
         self.recorder.stop(timeout_seconds=5.0)
         if self._report_worker is not None and self._report_worker.isRunning():
             self._report_worker.wait(15000)
+        # Closing the application used to finalize only the raw session.  When
+        # the operator closed Mission Control instead of pressing "수집 종료",
+        # the session was complete but its analysis folder was never created.
+        # At shutdown UI responsiveness no longer matters, so generate the
+        # missing report synchronously before releasing the process.
+        session_dir = self.recorder.session_dir
+        report_path = (
+            session_dir / "analysis" / "session_report.pdf"
+            if session_dir is not None
+            else None
+        )
+        if (
+            self.auto_report_checkbox.isChecked()
+            and session_dir is not None
+            and self.recorder.state == "stopped"
+            and report_path is not None
+            and not report_path.exists()
+        ):
+            try:
+                generate_session_report(session_dir)
+            except Exception as exc:
+                print(f"Automatic session report failed during shutdown: {exc}")
         self.worker.stop()
         self.worker.wait(2500)
         event.accept()

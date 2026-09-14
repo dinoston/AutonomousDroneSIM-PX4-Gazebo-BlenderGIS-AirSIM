@@ -119,6 +119,61 @@ def test_detected_facade_produces_a_lateral_fly_by_route() -> None:
     assert path[-1] == (100.0, 0.0, 5.0)
 
 
+def test_forward_advance_detour_does_not_begin_by_reversing() -> None:
+    config = PlannerConfig(
+        half_extent_m=900.0,
+        resolution_m=4.0,
+        drone_radius_m=4.0,
+        vertical_clearance_m=2.0,
+        altitude_step_m=4.0,
+        max_extra_altitude_m=12.0,
+    )
+    planner = AltitudeGridPlanner(config)
+    planner.set_obstacle_points(
+        build_vertical_barrier(
+            (20.0, 0.0, -5.0),
+            (1.0, 0.0),
+            8.0,
+            1.0,
+            17.0,
+        )
+    )
+
+    path = planner.plan((0.0, 0.0), (100.0, 0.0), 5.0, 5.0)
+
+    assert path
+    assert all(x_m >= 0.0 for x_m, _y_m, _altitude_m in path)
+    assert any(abs(y_m) >= 12.0 for _x_m, y_m, _altitude_m in path)
+
+
+def test_horizontal_rooftop_keeps_a_forward_climb_route_open() -> None:
+    config = PlannerConfig(
+        half_extent_m=900.0,
+        resolution_m=4.0,
+        drone_radius_m=4.0,
+        vertical_clearance_m=2.0,
+        altitude_step_m=4.0,
+        max_extra_altitude_m=12.0,
+    )
+    planner = AltitudeGridPlanner(config)
+    offsets = np.arange(-12.0, 12.1, 2.0, dtype=np.float32)
+    patch_x, patch_y = np.meshgrid(offsets, offsets)
+    rooftop = np.column_stack(
+        (
+            20.0 + patch_x.ravel(),
+            patch_y.ravel(),
+            np.full(patch_x.size, -4.0, dtype=np.float32),
+        )
+    )
+    planner.set_obstacle_points(rooftop)
+
+    path = planner.plan((0.0, 0.0), (100.0, 0.0), 5.0, 5.0)
+
+    assert path[0] == (0.0, 0.0, 9.0)
+    assert all(x_m >= 0.0 for x_m, _y_m, _altitude_m in path)
+    assert max(altitude_m for _x_m, _y_m, altitude_m in path) == 9.0
+
+
 def test_terminal_descent_is_separated_from_horizontal_flight() -> None:
     horizontal, descent_altitude = split_terminal_vertical_leg(
         [(20.0, -10.0, 13.0), (100.0, 0.0, 13.0), (100.0, 0.0, 5.0)]
