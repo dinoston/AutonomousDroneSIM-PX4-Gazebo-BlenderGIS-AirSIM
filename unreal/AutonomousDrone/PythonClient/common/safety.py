@@ -18,6 +18,23 @@ class FlightLimits:
 DEFAULT_LIMITS = FlightLimits()
 
 
+def minimum_braking_distance_m(
+    speed_mps: float,
+    reaction_time_s: float = 0.55,
+    deceleration_mps2: float = 3.5,
+    margin_m: float = 2.5,
+) -> float:
+    """Return a conservative obstacle braking distance for the simulator."""
+    speed = max(0.0, float(speed_mps))
+    deceleration = max(0.5, float(deceleration_mps2))
+    return max(
+        3.5,
+        speed * max(0.0, float(reaction_time_s))
+        + speed * speed / (2.0 * deceleration)
+        + max(0.0, float(margin_m)),
+    )
+
+
 def validate_destination(
     x_m: float,
     y_m: float,

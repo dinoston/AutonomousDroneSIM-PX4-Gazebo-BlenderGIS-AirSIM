@@ -75,6 +75,11 @@ class AirSimController:
         self.client = client
         self._configure_enemy_detection()
 
+    def scene_object_names(self) -> list[str]:
+        """Return object names used to identify the currently open Unreal level."""
+        client = self._require_client()
+        return [str(name) for name in client.simListSceneObjects(".*")]
+
     @property
     def segmentation_status(self) -> str:
         if self._segmentation_error:

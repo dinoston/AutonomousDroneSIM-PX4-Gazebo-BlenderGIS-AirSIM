@@ -6,6 +6,7 @@ import itertools
 import json
 import math
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -17,7 +18,7 @@ if str(PYTHON_CLIENT_ROOT) not in sys.path:
 
 import numpy as np
 from PySide6.QtCore import QSettings, QThread, Qt, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -44,6 +46,18 @@ from PySide6.QtWidgets import (
 )
 
 from common.airsim_client import AirSimController
+from common.safety import minimum_braking_distance_m
+from common.minimap_profiles import (
+    MinimapProfile,
+    build_scene_identity,
+    load_minimap_profiles,
+    match_minimap_profile,
+    resolve_profile_image,
+    save_minimap_profiles,
+    unique_profile_id,
+    upsert_minimap_profile,
+    with_scene_identity,
+)
 from data_collection.recorder import DataRecorder, RecordingConfig
 from data_collection.report import generate_session_report
 from navigation.grid_planner import (
@@ -69,6 +83,7 @@ class AirSimWorker(QThread):
     lidar_updated = Signal(object)
     radar_updated = Signal(object)
     environment_applied = Signal(dict)
+    scene_identified = Signal(object)
     command_completed = Signal(str)
     error_occurred = Signal(str)
 
@@ -336,6 +351,8 @@ class AirSimWorker(QThread):
                     self._start_environment_apply(args)
                 elif name == "segmentation":
                     self._start_semantic_setup()
+                elif name == "identify_scene":
+                    self.scene_identified.emit(self.controller.scene_object_names())
                 else:
                     raise ValueError(f"알 수 없는 명령: {name}")
                 if name not in {
@@ -343,6 +360,7 @@ class AirSimWorker(QThread):
                     "disconnect",
                     "segmentation",
                     "environment",
+                    "identify_scene",
                 }:
                     self.command_completed.emit(name)
             except Exception as exc:
@@ -416,12 +434,20 @@ class MissionControlWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(
             "Autonomous Drone Mission Control · Semantic/Data v1 · "
-            "Avoidance v13 Forward Advance"
+            "Avoidance v14 Urban Safety"
         )
         self.resize(1500, 920)
         self.settings = QSettings("AutonomousDrone", "MissionControl")
         self.recorder = DataRecorder()
         self._report_worker: ReportWorker | None = None
+        self._minimap_profile_path = (
+            PYTHON_CLIENT_ROOT / "config" / "minimap_profiles.json"
+        )
+        self._minimap_profiles = load_minimap_profiles(self._minimap_profile_path)
+        self._active_minimap_profile: MinimapProfile | None = None
+        self._last_scene_object_names: list[str] = []
+        self._pending_minimap_registration = False
+        self._scene_identification_in_progress = False
         self._connected = False
         self._connection_transition: str | None = None
         self._semantic_ready = False
@@ -505,6 +531,7 @@ class MissionControlWindow(QMainWindow):
         self.worker.lidar_updated.connect(self._on_lidar)
         self.worker.radar_updated.connect(self._on_radar)
         self.worker.environment_applied.connect(self._on_environment_applied)
+        self.worker.scene_identified.connect(self._on_scene_identified)
         self.worker.command_completed.connect(self._on_command_completed)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.start()
@@ -702,15 +729,43 @@ class MissionControlWindow(QMainWindow):
             fixed_color=(0.14, 0.55, 1.0, 0.95),
             point_size=9.0,
         )
-        minimap_image = PYTHON_CLIENT_ROOT / "assets" / "Minimap_AirBase.PNG"
+        initial_profile = self._minimap_profiles[0]
+        minimap_image = resolve_profile_image(PYTHON_CLIENT_ROOT, initial_profile)
         self.minimap = MiniMapWidget(
-            half_extent_m=700.0,
-            center_xy_m=(53.31, 159.39),
+            half_extent_m=initial_profile.half_extent_m,
+            center_xy_m=(initial_profile.center_x_m, initial_profile.center_y_m),
             background_path=str(minimap_image),
         )
+        self.minimap.map_name = initial_profile.display_name
+        self._active_minimap_profile = initial_profile
         self.minimap.spawn_selected.connect(self._on_spawn_selected)
         self.minimap.target_selected.connect(self._on_target_selected)
-        tabs.addTab(self.minimap, "미니맵 · A* 경로")
+        minimap_page = QWidget()
+        minimap_layout = QVBoxLayout(minimap_page)
+        minimap_toolbar = QHBoxLayout()
+        minimap_toolbar.addWidget(QLabel("현재 레벨 미니맵"))
+        self.minimap_profile_combo = QComboBox()
+        self._populate_minimap_profile_combo(initial_profile.profile_id)
+        self.minimap_profile_combo.currentIndexChanged.connect(
+            self._on_minimap_profile_selected
+        )
+        self.register_minimap_button = QPushButton("현재 레벨 미니맵 등록")
+        self.register_minimap_button.setToolTip(
+            "현재 Unreal 레벨의 장면 특징과 사용자가 만든 미니맵 이미지를 함께 등록합니다."
+        )
+        self.register_minimap_button.clicked.connect(
+            self._request_minimap_registration
+        )
+        minimap_toolbar.addWidget(self.minimap_profile_combo, 1)
+        minimap_toolbar.addWidget(self.register_minimap_button)
+        minimap_layout.addLayout(minimap_toolbar)
+        self.minimap_profile_status = QLabel(
+            "기본 AirBase 미니맵 · 연결하면 현재 레벨을 자동 확인합니다."
+        )
+        self.minimap_profile_status.setWordWrap(True)
+        minimap_layout.addWidget(self.minimap_profile_status)
+        minimap_layout.addWidget(self.minimap, 1)
+        tabs.addTab(minimap_page, "미니맵 · A* 경로")
         tabs.addTab(self._build_environment_panel(), "환경 · 날씨")
         # Keep collection next to the minimap so it remains visible even when
         # the sensor pane is narrow.
@@ -720,6 +775,289 @@ class MissionControlWindow(QMainWindow):
         tabs.addTab(self.lidar_viewer, "LiDAR 3D 점군")
         tabs.addTab(self.radar_viewer, "Radar 3D 점군")
         return tabs
+
+    def _populate_minimap_profile_combo(self, selected_profile_id: str = "") -> None:
+        """Refresh the manual fallback selector after a profile is registered."""
+        combo = self.minimap_profile_combo
+        combo.blockSignals(True)
+        combo.clear()
+        selected_index = 0
+        for index, profile in enumerate(self._minimap_profiles):
+            combo.addItem(profile.display_name, profile.profile_id)
+            if profile.profile_id == selected_profile_id:
+                selected_index = index
+        combo.setCurrentIndex(selected_index)
+        combo.blockSignals(False)
+
+    def _profile_by_id(self, profile_id: str) -> MinimapProfile | None:
+        for profile in self._minimap_profiles:
+            if profile.profile_id == profile_id:
+                return profile
+        return None
+
+    def _on_minimap_profile_selected(self, index: int) -> None:
+        if index < 0:
+            return
+        profile = self._profile_by_id(
+            str(self.minimap_profile_combo.itemData(index) or "")
+        )
+        if profile is not None:
+            self._apply_minimap_profile(profile, "수동 선택")
+
+    def _apply_minimap_profile(
+        self,
+        profile: MinimapProfile,
+        reason: str,
+    ) -> bool:
+        image_path = resolve_profile_image(PYTHON_CLIENT_ROOT, profile)
+        if not image_path.exists() or QPixmap(str(image_path)).isNull():
+            self.minimap_profile_status.setText(
+                f"{profile.display_name}: 이미지 파일을 열 수 없습니다 · {image_path}"
+            )
+            return False
+        self.minimap.set_background_map(
+            str(image_path),
+            profile.half_extent_m,
+            (profile.center_x_m, profile.center_y_m),
+            profile.display_name,
+        )
+        self._active_minimap_profile = profile
+        combo_index = self.minimap_profile_combo.findData(profile.profile_id)
+        if combo_index >= 0 and combo_index != self.minimap_profile_combo.currentIndex():
+            self.minimap_profile_combo.blockSignals(True)
+            self.minimap_profile_combo.setCurrentIndex(combo_index)
+            self.minimap_profile_combo.blockSignals(False)
+
+        # Keep A* bounds large enough for the coordinates covered by this map.
+        # New city maps use a finer grid than the open AirBase map so the
+        # shortest safe lane does not become a coarse staircase into a facade.
+        # 새 도심 지도는 공항 지도보다 세밀한 격자를 사용하여 최단 안전경로가
+        # 거친 계단 모양으로 건물 외벽을 스치지 않게 합니다.
+        urban_mode = profile.profile_id.casefold() != "airbase"
+        required_extent = min(
+            2500.0,
+            max(
+                900.0,
+                abs(profile.center_x_m) + profile.half_extent_m,
+                abs(profile.center_y_m) + profile.half_extent_m,
+            ),
+        )
+        old_config = self.planner.config
+        desired_resolution = 2.0 if urban_mode else 4.0
+        desired_altitude_step = 3.0 if urban_mode else 4.0
+        desired_extra_altitude = 18.0 if urban_mode else 12.0
+        planner_changed = (
+            not math.isclose(required_extent, old_config.half_extent_m)
+            or not math.isclose(desired_resolution, old_config.resolution_m)
+            or not math.isclose(desired_altitude_step, old_config.altitude_step_m)
+            or not math.isclose(
+                desired_extra_altitude,
+                old_config.max_extra_altitude_m,
+            )
+        )
+        if planner_changed:
+            old_points = self.planner.obstacle_points
+            self.planner = AltitudeGridPlanner(
+                PlannerConfig(
+                    half_extent_m=required_extent,
+                    resolution_m=desired_resolution,
+                    drone_radius_m=old_config.drone_radius_m,
+                    vertical_clearance_m=old_config.vertical_clearance_m,
+                    altitude_step_m=desired_altitude_step,
+                    max_extra_altitude_m=desired_extra_altitude,
+                )
+            )
+            self.planner.set_obstacle_points(old_points)
+        navigation_label = "도심 정밀·충돌우선" if urban_mode else "개활지 전진우선"
+        self.minimap_profile_status.setText(
+            f"{profile.display_name} · {reason} · 중심 X {profile.center_x_m:.1f}, "
+            f"Y {profile.center_y_m:.1f} m · 반경 {profile.half_extent_m:.1f} m · "
+            f"{navigation_label}"
+        )
+        return True
+
+    def _request_minimap_registration(self) -> None:
+        if not self._connected:
+            QMessageBox.information(
+                self,
+                "미니맵 등록",
+                "Unreal에서 새 레벨을 Play하고 AirSim을 연결한 뒤 등록해 주세요.",
+            )
+            return
+        self._pending_minimap_registration = True
+        self.register_minimap_button.setEnabled(False)
+        self.minimap_profile_status.setText("현재 Unreal 레벨의 장면을 확인하는 중…")
+        if not self._scene_identification_in_progress:
+            self._scene_identification_in_progress = True
+            self.worker.submit("identify_scene", priority=1)
+
+    def _on_scene_identified(self, object_names: object) -> None:
+        self._scene_identification_in_progress = False
+        self._last_scene_object_names = [str(item) for item in (object_names or [])]
+        if self._pending_minimap_registration:
+            self._pending_minimap_registration = False
+            self.register_minimap_button.setEnabled(self._connected)
+            self._open_minimap_registration_dialog()
+            return
+        profile, reason, score = match_minimap_profile(
+            self._last_scene_object_names,
+            self._minimap_profiles,
+        )
+        if profile is not None:
+            detail = reason if score >= 0.999 else f"{reason} {score * 100:.0f}%"
+            self._apply_minimap_profile(profile, f"자동 인식: {detail}")
+            return
+        current_name = (
+            self._active_minimap_profile.display_name
+            if self._active_minimap_profile is not None
+            else "기본 지도"
+        )
+        self.minimap_profile_status.setText(
+            f"등록되지 않은 새 레벨입니다 · 현재 {current_name} 임시 표시 · "
+            "[현재 레벨 미니맵 등록]을 눌러 연결하세요."
+        )
+
+    def _open_minimap_registration_dialog(self) -> None:
+        if not self._last_scene_object_names:
+            QMessageBox.warning(
+                self,
+                "미니맵 등록",
+                "현재 레벨의 장면 객체를 읽지 못했습니다. Play 상태를 확인해 주세요.",
+            )
+            return
+        default_name = self.city_edit.text().strip() or "새 지도"
+        if (
+            self._active_minimap_profile is not None
+            and default_name.casefold()
+            == self._active_minimap_profile.display_name.casefold()
+        ):
+            default_name = "새 지도"
+        display_name, accepted = QInputDialog.getText(
+            self,
+            "현재 레벨 미니맵 등록",
+            "레벨/지도 이름 (예: Seoul_Gangnam):",
+            text=default_name,
+        )
+        display_name = display_name.strip()
+        if not accepted or not display_name:
+            return
+        existing = next(
+            (
+                profile
+                for profile in self._minimap_profiles
+                if profile.display_name.casefold() == display_name.casefold()
+            ),
+            None,
+        )
+        if existing is not None:
+            answer = QMessageBox.question(
+                self,
+                "기존 미니맵 수정",
+                f"'{display_name}' 이름의 지도가 이미 있습니다.\n"
+                "해당 지도의 이미지와 좌표를 수정할까요?\n\n"
+                "새 지도로 추가하려면 '아니요'를 누르고 다른 이름으로 다시 등록하세요.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            profile_id = existing.profile_id
+        else:
+            # A new display name always receives a new ID. Scene similarity is
+            # never allowed to overwrite another BlenderGIS map.
+            profile_id = unique_profile_id(self._minimap_profiles, display_name)
+        image_path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "직접 만든 미니맵 이미지 선택",
+            str(Path.home()),
+            "Map images (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not image_path_text:
+            return
+        source_image = Path(image_path_text)
+        if QPixmap(str(source_image)).isNull():
+            QMessageBox.warning(self, "미니맵 등록", "선택한 이미지를 열 수 없습니다.")
+            return
+
+        base_center = self.minimap._base_center_xy_m
+        base_extent = self.minimap._base_half_extent_m
+        center_x, accepted = QInputDialog.getDouble(
+            self,
+            "미니맵 좌표 맞춤 (1/3)",
+            "이미지 정중앙의 AirSim NED X(북쪽) 좌표 [m]:",
+            float(base_center[0]),
+            -100000.0,
+            100000.0,
+            2,
+        )
+        if not accepted:
+            return
+        center_y, accepted = QInputDialog.getDouble(
+            self,
+            "미니맵 좌표 맞춤 (2/3)",
+            "이미지 정중앙의 AirSim NED Y(동쪽) 좌표 [m]:",
+            float(base_center[1]),
+            -100000.0,
+            100000.0,
+            2,
+        )
+        if not accepted:
+            return
+        half_extent, accepted = QInputDialog.getDouble(
+            self,
+            "미니맵 좌표 맞춤 (3/3)",
+            "이미지 중심에서 한쪽 끝까지의 실제 거리 [m]:",
+            float(base_extent),
+            10.0,
+            100000.0,
+            1,
+        )
+        if not accepted:
+            return
+
+        suffix = source_image.suffix.lower() or ".png"
+        destination_dir = PYTHON_CLIENT_ROOT / "assets" / "minimaps"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_image = destination_dir / f"{profile_id}{suffix}"
+        try:
+            if source_image.resolve() != destination_image.resolve():
+                shutil.copy2(source_image, destination_image)
+            profile = MinimapProfile(
+                profile_id=profile_id,
+                display_name=display_name,
+                image=destination_image.relative_to(PYTHON_CLIENT_ROOT).as_posix(),
+                center_x_m=center_x,
+                center_y_m=center_y,
+                half_extent_m=half_extent,
+            )
+            profile = with_scene_identity(
+                profile,
+                build_scene_identity(self._last_scene_object_names),
+            )
+            self._minimap_profiles = upsert_minimap_profile(
+                self._minimap_profiles,
+                profile,
+            )
+            save_minimap_profiles(
+                self._minimap_profile_path,
+                self._minimap_profiles,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "미니맵 등록", f"미니맵 저장 실패: {exc}")
+            return
+
+        self._populate_minimap_profile_combo(profile.profile_id)
+        self._apply_minimap_profile(profile, "현재 레벨에 새로 등록")
+        self.city_edit.setText(display_name)
+        QMessageBox.information(
+            self,
+            "미니맵 등록 완료",
+            f"'{display_name}' 미니맵을 현재 레벨과 연결했습니다.\n\n"
+            f"등록된 지도: {len(self._minimap_profiles)}개 (개수 제한 없음)\n\n"
+            "서울·판교처럼 구조가 비슷한 레벨을 자동 구분하려면 레벨에 빈 Actor를 "
+            f"하나 두고 이름을 MAPID_{profile.profile_id} 로 지정하세요. "
+            "마커가 없으면 위 목록에서 지도를 직접 선택할 수 있습니다.",
+        )
 
     def _build_environment_panel(self) -> QWidget:
         """Build deterministic weather controls used by collection sessions."""
@@ -1949,33 +2287,20 @@ class MissionControlWindow(QMainWindow):
             else float(self._telemetry["altitude"])
         )
         self.planner.set_obstacle_points(planning_points)
-        sensor_map_relaxed = False
-        try:
-            path = self.planner.plan(
-                start,
-                (target[0], target[1]),
-                safe_target_altitude,
-                current_altitude,
-                max_altitude_m=self._avoidance_altitude_ceiling_m,
-            )
-        except RuntimeError:
-            # Raw point clouds are instantaneous and can occasionally form a
-            # false closed ring. Retry with only collision-confirmed surfaces;
-            # the forward LiDAR guard remains active and will insert a verified
-            # detour well before any real wall is reached.
-            # 순간 점군이 가짜 폐곡선을 만들면 충돌로 확인된 면만 사용해 한 번
-            # 재시도합니다. 실제 벽은 전방 LiDAR가 미리 확인해 우회벽을 추가합니다.
-            self.planner.set_obstacle_points(self._collision_obstacle_points)
-            path = self.planner.plan(
-                start,
-                (target[0], target[1]),
-                safe_target_altitude,
-                current_altitude,
-                max_altitude_m=self._avoidance_altitude_ceiling_m,
-            )
-            sensor_map_relaxed = True
-        finally:
-            self.planner.set_obstacle_points(planning_points)
+        # Never discard the live LiDAR map merely to obtain a route. That old
+        # fallback was acceptable in the open AirBase scene, but in a dense
+        # city it could replace a failed safe plan with a line through a real
+        # building. A closed map now remains a closed map until a safe route is
+        # observed or the operator selects another target.
+        # 경로를 만들기 위해 실제 LiDAR 지도를 버리지 않습니다. 도심에서는
+        # 안전 경로 실패를 건물 관통 경로로 바꾸는 것보다 실패 상태를 유지합니다.
+        path = self.planner.plan(
+            start,
+            (target[0], target[1]),
+            safe_target_altitude,
+            current_altitude,
+            max_altitude_m=self._avoidance_altitude_ceiling_m,
+        )
         # Keep the terminal descent out of moveOnPathAsync. Its lookahead can
         # start descending while the drone is still above the building that it
         # is passing, causing repeated roof detections and hesitation.
@@ -1994,13 +2319,20 @@ class MissionControlWindow(QMainWindow):
         # Sending hover before every ordinary replan produced stop-and-go motion.
         # 새 경로 명령 자체가 기존 이동 명령을 대체하므로 일반 재탐색마다
         # 호버링을 먼저 보내지 않습니다. 실제 충돌 위험 때만 별도로 정지합니다.
+        urban_mode = (
+            self._active_minimap_profile is not None
+            and self._active_minimap_profile.profile_id.casefold() != "airbase"
+        )
+        command_speed = float(self.speed.value())
+        if urban_mode and planning_points.size:
+            command_speed = min(command_speed, 6.0)
         if collision_escape is None:
-            self.worker.submit("path", flight_path, self.speed.value(), priority=3)
+            self.worker.submit("path", flight_path, command_speed, priority=3)
         else:
             self.worker.submit(
                 "recovery_path",
                 flight_path,
-                self.speed.value(),
+                command_speed,
                 collision_escape[0],
                 collision_escape[1],
                 collision_escape[2],
@@ -2010,9 +2342,9 @@ class MissionControlWindow(QMainWindow):
             )
         cruise = max(point[2] for point in flight_path)
         self.message_label.setText(
-            f"{'재탐색' if replan else '경로 생성'} 완료"
-            f"{' · 순간 센서 폐곡선 제외' if sensor_map_relaxed else ''}: "
+            f"{'재탐색' if replan else '경로 생성'} 완료: "
             f"웨이포인트 {len(path)}개, 최고 {cruise:.1f}m"
+            f"{' · 도심 안전속도 6m/s 이하' if urban_mode and command_speed < float(self.speed.value()) else ''}"
         )
 
     def _on_connection_changed(self, connected: bool, message: str) -> None:
@@ -2023,6 +2355,9 @@ class MissionControlWindow(QMainWindow):
         if not connected:
             self._takeoff_pending = False
             self._environment_apply_pending = False
+            self._pending_minimap_registration = False
+            self._scene_identification_in_progress = False
+            self._last_scene_object_names = []
         if not connected and self.recorder.state in {"recording", "paused"}:
             self.recorder.stop()
         self.status_indicator.setText(f"● {message}")
@@ -2046,6 +2381,13 @@ class MissionControlWindow(QMainWindow):
             # PIE 재연결마다 마지막 환경 선택을 다시 적용하여 저장 조건과
             # 실제 시뮬레이터 상태가 어긋나지 않도록 합니다.
             self._apply_environment()
+            self.minimap_profile_status.setText("현재 Unreal 레벨을 자동 식별하는 중…")
+            self._scene_identification_in_progress = True
+            self.worker.submit("identify_scene", priority=2)
+        else:
+            self.minimap_profile_status.setText(
+                "AirSim 연결 후 현재 레벨에 맞는 미니맵을 자동으로 선택합니다."
+            )
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -2062,6 +2404,7 @@ class MissionControlWindow(QMainWindow):
             self.stop_patrol_button,
             self.segmentation_apply_button,
             self.environment_apply_button,
+            self.register_minimap_button,
         ):
             widget.setEnabled(enabled)
         self._refresh_collection_status()
@@ -3194,13 +3537,15 @@ class MissionControlWindow(QMainWindow):
 
         if obstacle_ahead is not None:
             obstacle_distance, hit_xyz, travel_direction, barrier_half_span = obstacle_ahead
-            # Forward Advance plans early but does not insert a hover merely
-            # because a wall entered a speed-scaled braking envelope. Only an
-            # immediately imminent contact may brake; ordinary poles, lamps,
-            # roofs and facades receive a moving replacement path.
-            # 장애물이 제동거리 안에 들어왔다는 이유만으로 호버링하지 않습니다.
-            # 실제 접촉 직전만 제동하고 나머지는 이동 중 경로를 교체합니다.
-            imminent_distance = 1.25
+            # The old fixed 1.25 m threshold was shorter than the stopping
+            # distance at city speeds. Use a speed-scaled envelope so the new
+            # path is still preferred, but the vehicle brakes before contact
+            # when a turn cannot settle in time.
+            # 기존 1.25m 고정 기준은 도심 비행속도의 제동거리보다 짧았습니다.
+            # 속도 비례 제동거리 안에서는 새 경로를 우선하되 접촉 전에 멈춥니다.
+            imminent_distance = minimum_braking_distance_m(
+                float(self._telemetry.get("speed", 0.0))
+            )
 
             if (
                 self._is_known_avoidance_surface(hit_xyz)
@@ -3301,11 +3646,9 @@ class MissionControlWindow(QMainWindow):
                     # 현재 위치에서 경로를 바로 교체하며 충돌 전 선제 후퇴는 하지
                     # 않습니다. 실제 충돌 때만 짧은 접촉 해제 이동을 허용합니다.
                     self._plan_and_fly(replan=True)
-                    # Give the lateral command a brief settling window. Close
-                    # obstacles still bypass this guard above.
-                    # 측면 명령이 잡힐 짧은 시간만 두며, 근접 장애물은 위에서
-                    # 이 유예를 무시하고 즉시 처리합니다.
-                    self._avoidance_grace_until = time.monotonic() + 2.0
+                    # A short settling window prevents duplicate replans. The
+                    # speed-scaled braking envelope above always overrides it.
+                    self._avoidance_grace_until = time.monotonic() + 0.8
                     self._last_avoided_obstacle_xy = (
                         float(hit_xyz[0]),
                         float(hit_xyz[1]),
@@ -3336,7 +3679,7 @@ class MissionControlWindow(QMainWindow):
                             max(0.5, barrier_half_span * 0.55),
                         )
                         self._plan_and_fly(replan=True)
-                        self._avoidance_grace_until = time.monotonic() + 2.0
+                        self._avoidance_grace_until = time.monotonic() + 0.8
                         self._last_avoided_obstacle_xy = (
                             float(hit_xyz[0]),
                             float(hit_xyz[1]),
@@ -3347,37 +3690,19 @@ class MissionControlWindow(QMainWindow):
                         )
                     except Exception as narrow_exc:
                         self._rollback_detected_wall(narrow_wall_count)
-                        if obstacle_distance <= imminent_distance:
-                            self.worker.submit("emergency", priority=0)
-                            self.message_label.setText(
-                                f"전방 {obstacle_distance:.1f}m 근접 장애물 · "
-                                f"안전 경로 재확인 중 ({narrow_exc})"
-                            )
-                        else:
-                            try:
-                                self._command_forward_bypass(
-                                    obstacle_distance,
-                                    travel_direction,
-                                    barrier_half_span,
-                                )
-                                self._avoidance_grace_until = time.monotonic() + 2.5
-                                self._last_avoided_obstacle_xy = (
-                                    float(hit_xyz[0]),
-                                    float(hit_xyz[1]),
-                                )
-                                self._last_avoided_obstacle_until = (
-                                    time.monotonic() + 12.0
-                                )
-                                self.message_label.setText(
-                                    f"전방 {obstacle_distance:.1f}m · "
-                                    "A* 폐쇄 구간을 큰 전진 우회로 통과"
-                                )
-                            except Exception as bypass_exc:
-                                self._avoidance_grace_until = time.monotonic() + 0.5
-                                self.message_label.setText(
-                                    f"전방 {obstacle_distance:.1f}m · "
-                                    f"기존 진행 유지 ({bypass_exc})"
-                                )
+                        # Do not invent an unvalidated forward/side shortcut in
+                        # a closed urban map. The previous fallback could choose
+                        # a clear-looking side that was actually another unseen
+                        # building. Hover and wait for a new scan or target.
+                        # 도심의 폐쇄 지도에서는 검증되지 않은 전진 우회를 만들지
+                        # 않습니다. 새 스캔이나 다른 목표를 기다리며 안전 호버링합니다.
+                        self.worker.discard_pending_navigation()
+                        self.worker.submit("emergency", priority=0)
+                        self._avoidance_grace_until = time.monotonic() + 0.5
+                        self.message_label.setText(
+                            f"전방 {obstacle_distance:.1f}m · 안전 경로 없음 · "
+                            f"충돌 방지 호버링 ({narrow_exc})"
+                        )
                 return
         else:
             self._obstacle_detection_count = 0
@@ -3411,6 +3736,13 @@ class MissionControlWindow(QMainWindow):
         if message.startswith("takeoff:"):
             self._takeoff_pending = False
             self.takeoff_button.setEnabled(self._connected)
+        if message.startswith("identify_scene:"):
+            self._scene_identification_in_progress = False
+            self._pending_minimap_registration = False
+            self.register_minimap_button.setEnabled(self._connected)
+            self.minimap_profile_status.setText(
+                "현재 레벨 자동 식별 실패 · 목록에서 지도를 선택할 수 있습니다."
+            )
         if message.startswith("environment:"):
             self._environment_apply_pending = False
             self.environment_apply_button.setEnabled(self._connected)

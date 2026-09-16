@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "profile_id": "airbase",
+      "display_name": "AirBase (기본 맵)",
+      "image": "assets/Minimap_AirBase.PNG",
+      "center_xy_m": [
+        53.31,
+        159.39
+      ],
+      "half_extent_m": 700.0,
+      "scene_signature": "",
+      "scene_anchors": []
+    }
+  ]
+}

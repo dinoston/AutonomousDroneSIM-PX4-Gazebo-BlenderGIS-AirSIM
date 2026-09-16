@@ -29,6 +29,7 @@ class MiniMapWidget(QWidget):
         self._drag_center_xy: tuple[float, float] | None = None
         self._dragging = False
         self.background = QPixmap(background_path or "")
+        self.map_name = ""
         self.drone_xy = (0.0, 0.0)
         self.spawn_xy = (0.0, 0.0)
         self.target_xy: tuple[float, float] | None = None
@@ -42,6 +43,30 @@ class MiniMapWidget(QWidget):
         self.setToolTip(
             "클릭: A/B 선택 · 왼쪽 드래그: 지도 이동 · 휠: 확대/축소 · 더블클릭: 전체 보기"
         )
+
+    def set_background_map(
+        self,
+        background_path: str,
+        half_extent_m: float,
+        center_xy_m: tuple[float, float],
+        map_name: str = "",
+    ) -> None:
+        """Replace the level image and its local-NED coordinate calibration."""
+        pixmap = QPixmap(str(background_path))
+        if pixmap.isNull():
+            raise ValueError(f"미니맵 이미지를 열 수 없습니다: {background_path}")
+        extent = float(half_extent_m)
+        if extent <= 0.0:
+            raise ValueError("미니맵 실제 반경은 0보다 커야 합니다.")
+        center = (float(center_xy_m[0]), float(center_xy_m[1]))
+        self.background = pixmap
+        self.map_name = str(map_name)
+        self._base_half_extent_m = extent
+        self._base_center_xy_m = center
+        self._minimum_half_extent_m = max(20.0, extent / 32.0)
+        self.half_extent_m = extent
+        self.center_xy_m = center
+        self.update()
 
     def set_selection_mode(self, mode: str) -> None:
         if mode not in {"spawn", "target"}:
@@ -186,7 +211,12 @@ class MiniMapWidget(QWidget):
         painter.setPen(QColor("#9fb1c5"))
         mode = "스폰 A" if self.selection_mode == "spawn" else "경유지 후보"
         zoom = self._base_half_extent_m / self.half_extent_m
-        painter.drawText(12, 22, f"N(+X) ↑    E(+Y) →    현재 선택: {mode}    줌: {zoom:.1f}x")
+        map_label = f"지도: {self.map_name}    " if self.map_name else ""
+        painter.drawText(
+            12,
+            22,
+            f"{map_label}N(+X) ↑    E(+Y) →    현재 선택: {mode}    줌: {zoom:.1f}x",
+        )
 
     def _map_rect(self):
         margin = 28.0

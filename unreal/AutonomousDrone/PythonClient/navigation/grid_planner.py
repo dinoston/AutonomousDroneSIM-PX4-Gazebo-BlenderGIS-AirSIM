@@ -266,7 +266,10 @@ class AltitudeGridPlanner:
         # 가로등·모서리는 실제 장애물로 유지하여 경로가 관통하지 않게 합니다.
         if len(start_footprint) >= 6:
             blocked = blocked - start_footprint
-        blocked.discard(goal)
+        # Never clear the goal cell. A target clicked on a building must be
+        # rejected instead of producing a route that deliberately enters it.
+        # 목표가 건물 위에 찍혔을 때 목표 셀을 강제로 비우면 마지막 구간에서
+        # 건물로 진입합니다. 목표 주변 안전 여유를 그대로 유지합니다.
         frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
         came_from: dict[tuple[int, int], tuple[int, int]] = {}
         cost = {start: 0.0}

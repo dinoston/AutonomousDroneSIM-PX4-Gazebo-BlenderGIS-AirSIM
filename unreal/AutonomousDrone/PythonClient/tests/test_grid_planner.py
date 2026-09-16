@@ -212,3 +212,21 @@ def test_start_footprint_returns_do_not_trap_the_vehicle() -> None:
     path = planner._astar(start, goal, blocked)
     assert path[0] == start
     assert path[-1] == goal
+
+
+def test_goal_inside_obstacle_is_not_cleared() -> None:
+    planner = AltitudeGridPlanner(
+        PlannerConfig(
+            half_extent_m=30.0,
+            resolution_m=1.0,
+            drone_radius_m=2.0,
+            max_extra_altitude_m=0.0,
+        )
+    )
+    goal_wall = np.array(
+        [(10.0, y, -5.0) for y in np.linspace(-30.0, 30.0, 121)],
+        dtype=np.float32,
+    )
+    planner.set_obstacle_points(goal_wall)
+    with pytest.raises(RuntimeError):
+        planner.plan((0.0, 0.0), (10.0, 0.0), 5.0, 5.0)
