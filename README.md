@@ -16,14 +16,22 @@
     <td align="center"><a href="media/enemy-drone-detection-demo.mp4"><img src="media/enemy-drone-detection-preview.gif" alt="Enemy drone detection and bounding-box demo" width="720" height="405"></a></td>
   </tr>
   <tr>
-    <th>Weather Control, Data Collection &amp; Human Detection / 날씨 제어 · 데이터 수집 · 사람 인식</th>
+    <th>Weather Control / 날씨 제어</th>
   </tr>
   <tr>
-    <td align="center"><a href="media/weather-data-human-detection-demo.mp4"><img src="media/weather-data-human-detection-preview.gif" alt="Weather control, data collection, and human detection demo" width="720" height="405"></a></td>
+    <td align="center"><a href="media/weather-control-demo.mp4"><img src="media/weather-control-preview.gif" alt="Weather control demo" width="720" height="405"></a></td>
+  </tr>
+  <tr>
+    <th>Data Collection &amp; Human Detection / 데이터 수집 · 사람 인식</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="media/data-collection-human-detection-demo.mp4"><img src="media/data-collection-human-detection-preview.gif" alt="Data collection and human detection demo" width="720" height="405"></a></td>
   </tr>
 </table>
 
 **Click an animated preview below to watch its full MP4. / 아래 움직이는 미리보기를 클릭하면 해당 전체 MP4 영상을 볼 수 있습니다.**
+
+**Full detailed video / 자세한 영상은 여기에서 확인하세요:** [YouTube](https://www.youtube.com/watch?v=tRIi0hX2qW8)
 
 ## English
 
